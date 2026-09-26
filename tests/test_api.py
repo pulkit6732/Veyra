@@ -117,6 +117,17 @@ class API(unittest.TestCase):
         self.assertEqual(self.api('deliveries/commit',{'ref':'D1'})[1]['status'],'COMPLETED')
         self.assertEqual(self.api('resolutions')[1][0]['movement_ref'],'A1')
 
+    def test_late_stale_submission_preserves_current_version_decision(self):
+        _,old=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        self.api('movements',{'ref':'R','kind':'RECEIVE','sku':'S','location':'WH/A','qty':1})
+        current=self.count(11)
+        self.assertEqual(self.api('counts/submit',{'session_id':old['session_id'],'qty':10})[1]['status'],'STALE')
+        self.prepare(self.order(qty=4))
+        _,decision=self.api('deliveries/commit',{'ref':'D1'})
+        self.assertEqual((decision['status'],decision['evidence_version']),('COMPLETED',1))
+        self.assertEqual(self.api('decisions')[1][0]['evidence_id'],current['evidence_id'])
+        self.assertEqual(self.api('delivery-events')[1][0]['evidence_id'],current['evidence_id'])
+
     def test_transfer_scoped_and_duplicate_reference(self):
         self.count()
         transfer={'kind':'TRANSFER','ref':'T1','sku':'S','location':'WH/A','destination':'OTHER/B','qty':3}

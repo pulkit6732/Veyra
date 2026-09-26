@@ -179,6 +179,27 @@ class Multiline(unittest.TestCase):
         self.assertEqual(self.call('deliveries/step',{'ref':'M','action':'PICK','line_id':next(x for x in m if x['ref']=='M')['lines'][0]['id'],'qty':1},other['token'])[0],200)
         self.assertEqual(self.call('deliveries/commit',{'ref':'M'})[0],401)
 
+    def test_delivery_list_batches_scopes_and_retains_line_labels(self):
+        self.counted('S',10)
+        self.counted('B',5)
+        self.api('deliveries/preflight',self.doc('M'))
+        for i in range(12):self.api('deliveries/preflight',self.doc('N'+str(i)))
+        with veyra.transaction() as db:
+            statements=[]
+            db.set_trace_callback(statements.append)
+            orders=veyra.list_data(db,'deliveries',{})
+            db.set_trace_callback(None)
+        self.assertEqual(len(orders),13)
+        self.assertEqual([o['ref'] for o in orders],sorted([o['ref'] for o in orders],reverse=True))
+        self.assertTrue(all([l['sku'] for l in o['lines']]==['S','B'] and
+                            [l['evidence'] for l in o['lines']]==['CURRENT','CURRENT'] for o in orders))
+        self.assertEqual(len([sql for sql in statements if sql.lstrip().upper().startswith(('SELECT','WITH'))]),3)
+        _,started=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        self.api('counts/submit',{'session_id':started['session_id'],'qty':9})
+        self.assertEqual(self.api('deliveries')[1][0]['lines'][0]['evidence'],'CONFLICT')
+        self.api('movements',{'ref':'R','kind':'RECEIVE','sku':'B','location':'WH/A','qty':1})
+        self.assertEqual([l['evidence'] for l in self.api('deliveries')[1][0]['lines']],['CONFLICT','STALE'])
+
     def test_invalid_lines_and_refresh(self):
         for doc in (self.doc(second=0),{'ref':'M','lines':[{'sku':'S','location':'WH/A','qty':1},{'sku':'BAD','location':'WH/A','qty':1}]},
                     {'ref':'M','lines':[{'sku':'S','location':'WH/A','qty':1},{'sku':'B','location':'BAD','qty':1}]}):
