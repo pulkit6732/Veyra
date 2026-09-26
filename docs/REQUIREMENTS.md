@@ -1,0 +1,17 @@
+# Source and repository audit (26 Sep 2026)
+
+Sources inspected: `C:/Users/ricky/Downloads/StockSense.pdf` (official problem statement); `C:/Users/ricky/Downloads/Odoo Hackathon Participant Document.pdf` (official participation/submission); `C:/Users/ricky/Downloads/StockSense - 8 hours.excalidraw` (supplied mockup); public `https://hackathon.odoo.com` responded 200 but individual team milestones/details require portal login. Local `FINAL_HACKATHON_DIRECTION.md`, `07_BUILD_PLAN.md`, `docs/HARNESS_AUDIT.md` are research, **not official requirements**. Participant guide MP4 is present but not transcribed/verified; do not infer constraints from it.
+
+A. Official must-haves (StockSense.pdf): signup/login and OTP reset; dashboard KPIs for products, low/out stock, pending receipts/deliveries/transfers; filters by document type/status/warehouse/location/category; product create/update (name, SKU, category, UOM, optional initial stock), per-location stock, reordering rules; receipts with supplier and validation, delivery pick/pack/validation, internal transfers with ledger entries, physical adjustments with logged changes; movement history; warehouses, locations; low-stock alerts, multiwarehouse, SKU search. Centralized real-time app. Official participant document: team leader selects statement, submits GitHub repository link **code in a single branch only** and solution video link; add assigned mentor's GitHub ID as collaborator; members confirm using registered GitHub accounts; follow portal milestones. Specific deadline is NOT in downloaded PDF; check authenticated portal.
+
+B. Official nice-to-haves: no explicit optional classification in statement. `Additional Features` labels alerts, multiwarehouse, SKU search but they are still requested; not assumed optional. Mockup suggests operation reference format, status progression, search, kanban, profile and responsive considerations; mockup is supplementary, not the PDF's explicit technical mandate.
+
+C. Our product requirements (user brief): real persistent database/API and responsive navigable UI, input validation, offline/local runnable setup, server-side audit and adversarial tests. No official downloaded source mandates offline, a specific API, a specific technology, AI usage, responsive UI, local DB, or Git branch *name*. Single branch is explicit. Website public landing page did not establish other constraints; do not claim them as official.
+
+D. Differentiating mechanism (user brief and local FINAL_HACKATHON_DIRECTION.md): physical count bound to version at count start, final transactional delivery guard on source SKU/bin, stale/missing/conflicting evidence holds, fresh agreeing recount releases. No novelty claim.
+
+E. Optional: kanban view, printing, predictive alerts, configurable policies.
+
+F. Not worth building now: 3D, blockchain, LLM, ML risk scores, cloud infra, automated root-cause attribution (user brief).
+
+Repository BEFORE changes: `D:/Veyra` contains only research Python/scripts/markdown and `docs/HARNESS_AUDIT.md`, no `.git`, no application. Existing: research probe only. Missing: frontend, backend, DB, ORM, API, auth, models, migrations, routes, UI, application tests, package manager, build/dev/production commands. Broken: no app to run and `git status` fails (`not a git repository`). Partially implemented: research-only in-memory scenarios (not product). Runnable: Python research scripts only. Untested: all product operations. No history/branch to preserve; do not invent one.

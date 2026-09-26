@@ -1,0 +1,706 @@
+{
+  "scope": "research-only in-memory probe; not existing product; no UI/DB/API tests",
+  "limitations": [
+    "single-process; no concurrent commit/transaction tested",
+    "physical observations synthetic; cannot prove physical truth",
+    "duplicate detection requires stable idempotency ref",
+    "hypotheses are not proven causes",
+    "no multi-SKU orders/lot identity/role auth tested"
+  ],
+  "summary": {
+    "pass": 11,
+    "fail": 0
+  },
+  "scenarios": [
+    {
+      "scenario": "A",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": {
+        "physical": 10,
+        "seq": 0,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION"
+      },
+      "actual": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION",
+        "action": "deliver",
+        "evidence_seq": 0
+      },
+      "candidate_1": {
+        "expected_contains": "NO_GAP_OBSERVED",
+        "actual": [
+          "NO_GAP_OBSERVED"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": false,
+        "actual": [],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "B",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": {
+        "physical": 8,
+        "seq": 0,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE",
+        "action": "investigate and recount S@A",
+        "gap": -2
+      },
+      "candidate_1": {
+        "expected_contains": "UNEXPLAINED_GAP",
+        "actual": [
+          "UNEXPLAINED_GAP",
+          "LOCATION_ERROR_POSSIBLE",
+          "UNRECORDED_MOVEMENT_POSSIBLE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            40,
+            "S",
+            "A",
+            "CONFLICTING_EVIDENCE"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "C",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": {
+        "physical": 0,
+        "seq": 0,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE",
+        "action": "investigate and recount S@A",
+        "gap": -10
+      },
+      "candidate_1": {
+        "expected_contains": "UNEXPLAINED_GAP",
+        "actual": [
+          "UNEXPLAINED_GAP",
+          "LOCATION_ERROR_POSSIBLE",
+          "UNRECORDED_MOVEMENT_POSSIBLE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            40,
+            "S",
+            "A",
+            "CONFLICTING_EVIDENCE"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {
+        "other_location_result": {
+          "decision": "BLOCK",
+          "reason": "NOT_ENOUGH_RECORDED",
+          "action": "investigate_stock"
+        }
+      },
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "D",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "kind": "DELIVER",
+          "sku": "S",
+          "qty": 2,
+          "source": "A",
+          "target": null,
+          "ref": "sale-1"
+        }
+      ],
+      "physical_observation": {
+        "physical": 10,
+        "seq": 0,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "STALE_EVIDENCE"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "STALE_EVIDENCE",
+        "action": "recount S@A",
+        "causal_event_seqs": [
+          1
+        ]
+      },
+      "candidate_1": {
+        "expected_contains": "STALE_COUNT",
+        "actual": [
+          "STALE_COUNT",
+          "MOVEMENT_DURING_VERIFICATION_POSSIBLE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            40,
+            "S",
+            "A",
+            "STALE_EVIDENCE"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "E",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 5,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "kind": "ADJUST_PLUS",
+          "sku": "S",
+          "qty": 2,
+          "source": "A",
+          "target": null,
+          "ref": "adj-7"
+        }
+      ],
+      "physical_observation": {
+        "physical": 7,
+        "seq": 1,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION"
+      },
+      "actual": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION",
+        "action": "deliver",
+        "evidence_seq": 1
+      },
+      "candidate_1": {
+        "expected_contains": "NO_GAP_OBSERVED",
+        "actual": [
+          "NO_GAP_OBSERVED"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": false,
+        "actual": [],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {
+        "first_adjustment": true,
+        "duplicate_accepted": false
+      },
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "F",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": {
+        "physical": 9,
+        "seq": 0,
+        "witness": "counter-2",
+        "conflicting": true,
+        "prior": {
+          "physical": 10,
+          "seq": 0,
+          "witness": "counter-1",
+          "conflicting": false,
+          "prior": null
+        }
+      },
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_COUNTS"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_COUNTS",
+        "action": "supervisor recount S@A"
+      },
+      "candidate_1": {
+        "expected_contains": "UNEXPLAINED_GAP",
+        "actual": [
+          "UNEXPLAINED_GAP",
+          "LOCATION_ERROR_POSSIBLE",
+          "UNRECORDED_MOVEMENT_POSSIBLE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            40,
+            "S",
+            "A",
+            "CONFLICTING_COUNTS"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "G",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": {
+        "physical": 8,
+        "seq": 0,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE",
+        "action": "investigate and recount S@A",
+        "gap": -2
+      },
+      "candidate_1": {
+        "expected_contains": "UNEXPLAINED_GAP",
+        "actual": [
+          "UNEXPLAINED_GAP",
+          "LOCATION_ERROR_POSSIBLE",
+          "UNRECORDED_MOVEMENT_POSSIBLE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            40,
+            "S",
+            "A",
+            "CONFLICTING_EVIDENCE"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "H",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": null,
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "NO_EVIDENCE"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "NO_EVIDENCE",
+        "action": "count S@A"
+      },
+      "candidate_1": {
+        "expected_contains": "NO_PHYSICAL_EVIDENCE",
+        "actual": [
+          "NO_PHYSICAL_EVIDENCE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            40,
+            "S",
+            "A",
+            "NO_EVIDENCE"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "I",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 9,
+          "high_value": true
+        }
+      },
+      "events": [],
+      "physical_observation": {
+        "physical": 8,
+        "seq": 0,
+        "witness": "counter-1",
+        "conflicting": false,
+        "prior": null
+      },
+      "expected": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE"
+      },
+      "actual": {
+        "decision": "BLOCK",
+        "reason": "CONFLICTING_EVIDENCE",
+        "action": "investigate and recount S@A",
+        "gap": -2
+      },
+      "candidate_1": {
+        "expected_contains": "UNEXPLAINED_GAP",
+        "actual": [
+          "UNEXPLAINED_GAP",
+          "LOCATION_ERROR_POSSIBLE",
+          "UNRECORDED_MOVEMENT_POSSIBLE"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": true,
+        "actual": [
+          [
+            90,
+            "S",
+            "A",
+            "CONFLICTING_EVIDENCE"
+          ]
+        ],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {},
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "J",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 4,
+          "high_value": true
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "kind": "DELIVER",
+          "sku": "S",
+          "qty": 2,
+          "source": "A",
+          "target": null,
+          "ref": "sale-1"
+        }
+      ],
+      "physical_observation": {
+        "physical": 8,
+        "seq": 1,
+        "witness": "counter-2",
+        "conflicting": false,
+        "prior": {
+          "physical": 10,
+          "seq": 0,
+          "witness": "counter-1",
+          "conflicting": false,
+          "prior": null
+        }
+      },
+      "expected": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION"
+      },
+      "actual": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION",
+        "action": "deliver",
+        "evidence_seq": 1
+      },
+      "candidate_1": {
+        "expected_contains": "NO_GAP_OBSERVED",
+        "actual": [
+          "NO_GAP_OBSERVED"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": false,
+        "actual": [],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {
+        "before_recount": {
+          "decision": "BLOCK",
+          "reason": "STALE_EVIDENCE",
+          "action": "recount S@A",
+          "causal_event_seqs": [
+            1
+          ]
+        }
+      },
+      "result": "PASS",
+      "failure": null
+    },
+    {
+      "scenario": "K",
+      "input_state": {
+        "initial_sku": "S",
+        "initial_location": "A",
+        "initial_on_hand": 10,
+        "order": {
+          "sku": "S",
+          "location": "A",
+          "qty": 9,
+          "high_value": true
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "kind": "RECEIVE",
+          "sku": "S",
+          "qty": 2,
+          "source": null,
+          "target": "A",
+          "ref": "receipt-1"
+        }
+      ],
+      "physical_observation": {
+        "physical": 12,
+        "seq": 1,
+        "witness": "counter-2",
+        "conflicting": false,
+        "prior": {
+          "physical": 10,
+          "seq": 0,
+          "witness": "counter-1",
+          "conflicting": false,
+          "prior": null
+        }
+      },
+      "expected": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION"
+      },
+      "actual": {
+        "decision": "ALLOW",
+        "reason": "VERIFIED_AT_CURRENT_VERSION",
+        "action": "deliver",
+        "evidence_seq": 1
+      },
+      "candidate_1": {
+        "expected_contains": "NO_GAP_OBSERVED",
+        "actual": [
+          "NO_GAP_OBSERVED"
+        ],
+        "result": "PASS"
+      },
+      "candidate_2": {
+        "expected_queue_nonempty": false,
+        "actual": [],
+        "result": "PASS"
+      },
+      "candidate_3": {
+        "result": "PASS"
+      },
+      "extra": {
+        "before_recount": {
+          "decision": "BLOCK",
+          "reason": "STALE_EVIDENCE",
+          "action": "recount S@A",
+          "causal_event_seqs": [
+            1
+          ]
+        },
+        "digital_balance_at_block": 12
+      },
+      "result": "PASS",
+      "failure": null
+    }
+  ]
+}

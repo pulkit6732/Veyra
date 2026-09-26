@@ -1,0 +1,27 @@
+# Mechanism selection (scores are judgment calls, not measured market shares)
+
+Scores 0–5: D differentiation, V user value, C 30-second clarity, T technical depth, B buildability, R demo reliability, H challenge fit, F defensibility. Assumes movement ledger exists; *unverified*. Scores are not claims of product uniqueness. Total /40.
+
+| Candidate/new action | Evidence and advantage | Weakness / implementation requirement / hostile judge attack | D V C T B R H F | Status |
+|---|---|---|---|---|
+| 1. Event classifier: labels possible gap causes | Review flows and explainable flags exist [S3,S5]. Easy to demo. | Cannot prove theft/location error from a quantity gap; terms only. Requires event read. “Is this just a timeline/LLM wrapper?” YES if sold as root cause. | 1 2 2 2 5 4 5 0 = 21 | KILL as differentiator; maintain conservative labels only |
+| 2. Risk-ranked verification queue: selects a next count | Threshold/plan-generated and ranked work exist [S3,S6]. Could save time. | Uses arbitrary weights; no measured information gain; “I've seen this.” Requires orders+count state. | 1 3 3 2 5 4 5 1 = 24 | KILL standalone; optional subordinate action |
+| 3. **Evidence-gated delivery:** blocks a pick with enough *recorded* stock when the supporting SKU/bin count is stale, missing under high-value policy, or conflicting; names smallest recount; releases only after fresh evidence | [S1–S6] show constituents; exact synchronous version-bound gate not verified. Demonstrates prevented bad pick with one movement, not a dashboard. | ERP holds/custom rules may duplicate it; physical evidence can be false; requires atomic hook into real delivery transaction. “Why can't SAP add it?” It can. | 3 5 5 4 3 4 5 2 = 31 | **SURVIVES conditionally**, not uniquely invented |
+| 4. Auto-root-cause resolution from event trace | Related to [S5]. | Impossible to establish causality from one count and ledger alone. Auto-adjust can destroy evidence. | 1 2 3 3 2 1 4 0 = 16 | KILL |
+| 5. Cross-WMS evidence reconciliation | Dexory [S5] already integrates. | Need external APIs, conflict authority and identity mapping; >6h. | 1 4 2 4 0 1 4 0 = 16 | ROADMAP ONLY |
+
+## Surviving mechanism: technical contract
+
+- **Input:** order lines `(sku, bin, requested_qty, value_class)`, available balance, append-only RECEIVE/DELIVER/TRANSFER/ADJUST events `(id, seq, sku, source, dest, qty, ref)`, observations `(count_id, sku, bin, physical_qty, capture_seq, count_started_at, submitted_at, counter_id)`, policy version.
+- **State:** bin/SKU ledger version, balance, outstanding evidence conflicts and order hold state. Sequence (not wall-clock order) is authority for *recorded* movements. Physical count remains fallible.
+- **Rule:** `qty > balance` → ordinary insufficient-stock rejection. For high-value or explicitly flagged item without an observation → hold. If an event relevant to this bin/SKU occurs after observation's snapshot version, or a conflicting count exists → hold. If fresh count differs from ledger balance → hold. Otherwise allow *only at checked version*. A low-value SKU with no evidence may pass by *explicit, visible policy*, not implied certainty. Two counters disagreeing require explicit witnessed adjudication; never silently overwrite.
+- **Decision/output:** `ALLOW` or `BLOCK(reason, exact SKU/bin, relevant event IDs, required verification)`; never autonomously infer cause, count stock or correct balance. Show which order would be affected.
+- **Persisted evidence:** original observations (never overwritten), policy version, evaluated balance/ledger version, decision + reason, witness, relevant event IDs, actor, override rationale and later action; movement remains separately logged.
+- **Commit invariant:** in ONE DB transaction lock affected SKU/bin rows, re-evaluate all order lines at latest committed version, reserve/decrement and write movement + decision. Retry if version changed. Reject if evidence changed after read. A UI-only preflight is not enforcement. An observation must carry capture version from count *start*, so a movement mid-count makes it stale. Physical counting is not made true by a witness ID.
+- **Failure mode:** missing data or conflicts for guarded orders → fail closed and manual supervised route; a stale observation must not auto-rebase over a transfer. False positives cost a recount; track holds, prevented short-pick attempts and seconds to clear; demonstrate only synthetic counterfactuals, not real savings.
+
+## 90–150 second demo for survivor
+
+**Start:** high-value S, bin A, recorded 10, last witnessed physical count 10, order 9. **Action:** warehouse operator submits transfer or delivery of 2 after count; then requests pick 9. **Reasoning:** relevant movement advanced version; count is stale, recorded 8 now, so for the surprising case use instead a RECEIVE of 2, recorded **12**, order 9, stale count **10**. **Result:** stock is sufficient but fulfillment is **BLOCKED: stale evidence; count S@A** (not simply insufficient stock). **Action:** worker counts bin A as 12, submits bound to current version; commit order. **Outcome:** hold removed, movement recorded once, order now fulfilled, decision trail shows before/after version. Optional second run: conflicting 10 vs 9 blocks even without movement. Caveat: no real picker protection without actual transactional delivery integration.
+
+See [06_LOCAL_SCENARIO_RESULTS.json](06_LOCAL_SCENARIO_RESULTS.json) for in-memory prototype tests; they do **not** prove production integration.
