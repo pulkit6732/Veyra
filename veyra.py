@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS stock(product_id INTEGER NOT NULL REFERENCES products
 CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY, ref TEXT UNIQUE NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('RECEIVE','DELIVER','TRANSFER','ADJUST')), product_id INTEGER NOT NULL REFERENCES products(id), source_id INTEGER REFERENCES locations(id), dest_id INTEGER REFERENCES locations(id), qty INTEGER NOT NULL, source_version INTEGER, dest_version INTEGER, actor INTEGER NOT NULL REFERENCES users(id), contact TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS count_sessions(id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), captured_version INTEGER NOT NULL, captured_qty INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','SUBMITTED','CANCELED')));
 CREATE TABLE IF NOT EXISTS evidence(id INTEGER PRIMARY KEY, session_id INTEGER UNIQUE NOT NULL REFERENCES count_sessions(id), product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), observed_qty INTEGER NOT NULL CHECK(observed_qty>=0), captured_version INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL, submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS resolutions(id INTEGER PRIMARY KEY, evidence_id INTEGER NOT NULL UNIQUE REFERENCES evidence(id), movement_ref TEXT NOT NULL UNIQUE REFERENCES movements(ref), note TEXT NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS deliveries(ref TEXT PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), qty INTEGER NOT NULL CHECK(qty>0), contact TEXT, state TEXT NOT NULL CHECK(state IN ('PENDING','DONE','CANCELED')), actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, ref TEXT NOT NULL REFERENCES deliveries(ref), stage TEXT NOT NULL CHECK(stage IN ('PREFLIGHT','COMMIT')), status TEXT NOT NULL, reason TEXT NOT NULL, evidence_version INTEGER, current_version INTEGER NOT NULL, evidence_id INTEGER REFERENCES evidence(id), stock_qty INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS ix_movements_product ON movements(product_id,created_at);
@@ -193,6 +194,62 @@ def submit_count(db,data,actor):
     db.execute("UPDATE count_sessions SET status='SUBMITTED' WHERE id=?",(sid,))
     return {'evidence_id':cur.lastrowid,'status':status,'evidence_version':session['captured_version'],'current_version':s['version']}
 
+def investigation(db, query):
+    if query.get('evidence_id'):
+        eid=integer(int(query['evidence_id'][0]) if query['evidence_id'][0].isdigit() else None,'evidence_id',1)
+        e=one(db,'SELECT e.*,cs.captured_qty FROM evidence e JOIN count_sessions cs ON cs.id=e.session_id WHERE e.id=?',(eid,))
+        if not e: raise Failure('INVALID_EVIDENCE',404)
+        p=one(db,'SELECT * FROM products WHERE id=?',(e['product_id'],))
+        l=one(db,'SELECT l.*,w.code warehouse FROM locations l JOIN warehouses w ON w.id=l.warehouse_id WHERE l.id=?',(e['location_id'],))
+        s=one(db,'SELECT * FROM stock WHERE product_id=? AND location_id=?',(p['id'],l['id']))
+    else:
+        p,l,s=scope(db,query.get('sku',[None])[0],query.get('location',[None])[0])
+        e=one(db,'SELECT e.*,cs.captured_qty FROM evidence e JOIN count_sessions cs ON cs.id=e.session_id WHERE e.product_id=? AND e.location_id=? ORDER BY e.id DESC LIMIT 1',(p['id'],l['id']))
+    if not e:
+        return {'sku':p['sku'],'name':p['name'],'location':l['warehouse']+'/'+l['code'],'current':{'qty':s['qty'],'version':s['version']},'evidence':None,'last_verified':None,'events':[],'event_total':0,'signals':[{'type':'NO_EVIDENCE','text':'No physical count is recorded for this SKU and location. Requires verification.'}],'resolution':None}
+    previous=one(db,"SELECT id,observed_qty,captured_version,submitted_at FROM evidence WHERE product_id=? AND location_id=? AND id<? AND status='VERIFIED' ORDER BY id DESC LIMIT 1",(p['id'],l['id'],e['id']))
+    anchor=previous['captured_version'] if previous else e['captured_version']
+    where='m.product_id=? AND ((m.source_id=? AND m.source_version>? AND m.source_version<=?) OR (m.dest_id=? AND m.dest_version>? AND m.dest_version<=?))'
+    args=(p['id'],l['id'],anchor,s['version'],l['id'],anchor,s['version'])
+    total=one(db,'SELECT COUNT(*) n FROM movements m WHERE '+where,args)['n']
+    events=rows(db,'SELECT m.ref,m.kind,m.qty,m.created_at,m.source_version,m.dest_version,sw.code || "/" || sl.code source,dw.code || "/" || dl.code destination,u.username actor_name FROM movements m JOIN users u ON u.id=m.actor LEFT JOIN locations sl ON sl.id=m.source_id LEFT JOIN warehouses sw ON sw.id=sl.warehouse_id LEFT JOIN locations dl ON dl.id=m.dest_id LEFT JOIN warehouses dw ON dw.id=dl.warehouse_id WHERE '+where+' ORDER BY m.id DESC LIMIT 50',args)
+    resolution=one(db,'SELECT r.id,r.movement_ref,r.note,r.created_at,u.username actor_name FROM resolutions r JOIN users u ON u.id=r.actor WHERE r.evidence_id=?',(e['id'],))
+    signals=[]
+    if e['captured_version']!=s['version']:
+        signals.append({'type':'STALE','text':'Recorded inventory changed after this count. The observation cannot authorize a delivery; recount at the current version.'})
+    if e['observed_qty']!=e['captured_qty']:
+        signals.append({'type':'VARIANCE','text':'Physical observation differs from the recorded quantity at count start. Cause is not established by this count.'})
+    if events:
+        signals.append({'type':'RECORDED_EVENTS','text':'Recorded movements exist in this location since the previous verified count'+(' (including events after this count).' if e['captured_version']!=s['version'] else '. No event alone proves the physical variance.')})
+        if any(m['kind']=='TRANSFER' for m in events):
+            signals.append({'type':'TRANSFER_RECORDED','text':'A transfer touched this bin. Verify the source and destination before attributing a physical variance.'})
+        if any(m['kind']=='ADJUST' for m in events):
+            signals.append({'type':'ADJUSTMENT_RECORDED','text':'An explicit adjustment changed the ledger. Review its reference and resolution note where available.'})
+    elif e['observed_qty']!=e['captured_qty']:
+        signals.append({'type':'UNEXPLAINED','text':'No recorded movement in this version window explains the physical variance. Check the bin and transaction records.'})
+    if resolution: signals.append({'type':'RESOLVED','text':'An explicit adjustment was logged. A new agreeing count is still required for delivery.'})
+    if not signals: signals.append({'type':'AGREES','text':'The recorded and observed quantities agreed at count submission. This does not prove physical truth.'})
+    return {'sku':p['sku'],'name':p['name'],'location':l['warehouse']+'/'+l['code'],'current':{'qty':s['qty'],'version':s['version']},'evidence':{'id':e['id'],'expected':e['captured_qty'],'observed':e['observed_qty'],'variance':e['observed_qty']-e['captured_qty'],'captured_version':e['captured_version'],'status_at_submission':e['status'],'submitted_at':e['submitted_at']},'last_verified':previous,'events':events,'event_total':total,'signals':signals,'resolution':resolution}
+
+def resolve(db,data,actor):
+    eid=integer(data.get('evidence_id'),'evidence_id',1)
+    ref=text(data.get('ref'),'ref',80)
+    note=text(data.get('note'),'note',500)
+    e=one(db,'SELECT * FROM evidence WHERE id=?',(eid,))
+    if not e: raise Failure('INVALID_EVIDENCE',404)
+    if one(db,'SELECT id FROM resolutions WHERE evidence_id=?',(eid,)): raise Failure('ALREADY_RESOLVED',409)
+    if one(db,'SELECT id FROM movements WHERE ref=?',(ref,)) or one(db,'SELECT ref FROM deliveries WHERE ref=?',(ref,)): raise Failure('DUPLICATE_REFERENCE',409)
+    s=one(db,'SELECT * FROM stock WHERE product_id=? AND location_id=?',(e['product_id'],e['location_id']))
+    latest=one(db,'SELECT id FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC',(e['product_id'],e['location_id']))
+    if s['version']!=e['captured_version'] or latest['id']!=eid: raise Failure('STALE_EVIDENCE',409)
+    if e['status']!='DISCREPANCY' or e['observed_qty']==s['qty']: raise Failure('NOT_AN_OPEN_DISCREPANCY',409)
+    p=one(db,'SELECT * FROM products WHERE id=?',(e['product_id'],))
+    l=one(db,'SELECT * FROM locations WHERE id=?',(e['location_id'],))
+    version=stock_change(db,p,l,e['observed_qty']-s['qty'])
+    db.execute('INSERT INTO movements(ref,kind,product_id,source_id,qty,source_version,actor) VALUES(?,?,?,?,?,?,?)',(ref,'ADJUST',p['id'],l['id'],e['observed_qty'],version,actor))
+    db.execute('INSERT INTO resolutions(evidence_id,movement_ref,note,actor) VALUES(?,?,?,?)',(eid,ref,note,actor))
+    return {'status':'ADJUSTED','ref':ref,'evidence_id':eid,'previous':s['qty'],'current':e['observed_qty'],'version':version,'required_action':'RECOUNT'}
+
 def decide(db,ref,p,l,s,qty,actor,stage):
     all_e=rows(db,'SELECT * FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC',(p['id'],l['id']))
     latest=all_e[0] if all_e else None
@@ -243,6 +300,8 @@ def list_data(db,name,query):
     if name=='decisions': return rows(db,'SELECT d.*,p.sku,w.code || "/" || l.code location FROM decisions d JOIN deliveries o ON o.ref=d.ref JOIN products p ON p.id=o.product_id JOIN locations l ON l.id=o.location_id JOIN warehouses w ON w.id=l.warehouse_id ORDER BY d.id DESC LIMIT 200')
     if name=='evidence': return rows(db,'SELECT e.*,p.sku,w.code || "/" || l.code location,u.username actor_name FROM evidence e JOIN products p ON p.id=e.product_id JOIN locations l ON l.id=e.location_id JOIN warehouses w ON w.id=l.warehouse_id JOIN users u ON u.id=e.actor ORDER BY e.id DESC LIMIT 200')
     if name=='deliveries': return rows(db,'SELECT o.*,p.sku,w.code || "/" || l.code location FROM deliveries o JOIN products p ON p.id=o.product_id JOIN locations l ON l.id=o.location_id JOIN warehouses w ON w.id=l.warehouse_id ORDER BY o.created_at DESC')
+    if name=='investigations': return investigation(db,query)
+    if name=='resolutions': return rows(db,'SELECT r.*,e.observed_qty,p.sku,w.code || "/" || l.code location,u.username actor_name FROM resolutions r JOIN evidence e ON e.id=r.evidence_id JOIN products p ON p.id=e.product_id JOIN locations l ON l.id=e.location_id JOIN warehouses w ON w.id=l.warehouse_id JOIN users u ON u.id=r.actor ORDER BY r.id DESC LIMIT 200')
     if name=='dashboard':
         return {'products':one(db,'SELECT COUNT(*) n FROM products')['n'],'units':one(db,'SELECT COALESCE(SUM(qty),0) n FROM stock')['n'],'low_stock':one(db,'SELECT COUNT(*) n FROM stock s JOIN products p ON p.id=s.product_id WHERE s.qty<=p.reorder_point')['n'],'pending_deliveries':one(db,"SELECT COUNT(*) n FROM deliveries WHERE state='PENDING'")['n'],'held_decisions':one(db,"SELECT COUNT(*) n FROM decisions WHERE status='BLOCKED'")['n']}
     if name in ('products','warehouses','locations','categories'):
@@ -273,11 +332,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 token=self.headers.get('Authorization','').removeprefix('Bearer ')
                 actor=auth(db,token)
-                if self.command=='GET':result=list_data(db,name,parse_qs(parsed.query))
+                if self.command=='GET':
+                    if name=='counts/open':
+                        result=one(db,"SELECT cs.id session_id,cs.captured_version,cs.captured_qty recorded_qty,p.sku,w.code || '/' || l.code location FROM count_sessions cs JOIN products p ON p.id=cs.product_id JOIN locations l ON l.id=cs.location_id JOIN warehouses w ON w.id=l.warehouse_id WHERE cs.actor=? AND cs.status='OPEN' ORDER BY cs.id DESC LIMIT 1",(actor,))
+                    else:result=list_data(db,name,parse_qs(parsed.query))
                 elif name=='logout': db.execute('DELETE FROM sessions WHERE token=?',(token,));result={'status':'LOGGED_OUT'}
                 elif name=='products/update':result=update_product(db,data)
                 elif name in ('products','warehouses','locations','categories'):result=create(db,name,data)
                 elif name=='movements':result=movement(db,data,actor)
+                elif name=='investigations/resolve':result=resolve(db,data,actor)
                 elif name=='counts/start':result=start_count(db,data,actor)
                 elif name=='counts/submit':result=submit_count(db,data,actor)
                 elif name in ('deliveries/preflight','deliveries/commit'):result=delivery(db,data,actor,name.endswith('commit'))

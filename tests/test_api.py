@@ -32,7 +32,7 @@ class API(unittest.TestCase):
             finally:e.close()
     def setUp(self):
         with veyra.transaction() as db:
-            for table in ('decisions','movements','deliveries','evidence','count_sessions','stock','sessions','locations','warehouses','products','categories','users'):
+            for table in ('decisions','resolutions','movements','deliveries','evidence','count_sessions','stock','sessions','locations','warehouses','products','categories','users'):
                 db.execute('DELETE FROM '+table)
         _,u=self.call('signup',{'username':'worker','password':'longpassword123'})
         self.token=u['token'];self.setup_base()
@@ -91,6 +91,7 @@ class API(unittest.TestCase):
         self.assertEqual(self.api('movements',transfer)[0],200)
         self.assertEqual(self.api('movements',transfer)[1]['error'],'DUPLICATE_REFERENCE')
         self.assertEqual(next(s['qty'] for s in self.api('inventory')[1] if s['location']=='A'),7)
+        self.assertEqual(sum(s['qty'] for s in self.api('inventory')[1]),10) # transfer conserves total
         self.assertEqual(self.api('deliveries/commit',self.order('D1',qty=6))[1]['reason'],'STALE_PHYSICAL_EVIDENCE')
         self.assertEqual(self.api('deliveries/commit',self.order('D2',location='OTHER/B',qty=2))[1]['reason'],'MISSING_PHYSICAL_EVIDENCE')
         self.assertEqual(self.api('deliveries/commit',self.order('T1'))[1]['error'],'DUPLICATE_REFERENCE')
@@ -105,6 +106,84 @@ class API(unittest.TestCase):
         self.assertEqual(self.call('counts/submit',{'session_id':s['session_id'],'qty':10},second['token'])[1]['error'],'FORBIDDEN')
         self.assertEqual(self.call('movements',{'kind':'RECEIVE','ref':'N1','sku':'S','location':'WH/A','qty':2})[0],401)
         self.assertEqual(self.api('inventory')[1][0]['qty'],10)
+    def test_investigation_resolution_and_recount(self):
+        self.count(10)
+        _,ev=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        _,dis=self.api('counts/submit',{'session_id':ev['session_id'],'qty':9})
+        eid=dis['evidence_id']
+        status,case=self.api('investigations?evidence_id='+str(eid))
+        self.assertEqual((status,case['evidence']['expected'],case['evidence']['observed'],case['evidence']['variance']),(200,10,9,-1))
+        self.assertEqual(case['last_verified']['observed_qty'],10)
+        self.assertEqual(case['event_total'],0)
+        self.assertIn('UNEXPLAINED',[s['type'] for s in case['signals']])
+        self.assertEqual(self.api('deliveries/commit',self.order())[1]['reason'],'CONFLICTING_PHYSICAL_EVIDENCE')
+        resolution={'evidence_id':eid,'ref':'ADJ1','note':'Bin recounted by operator; one missing'}
+        self.assertEqual(self.api('investigations/resolve',resolution)[1]['required_action'],'RECOUNT')
+        self.assertEqual(self.api('investigations/resolve',resolution)[1]['error'],'ALREADY_RESOLVED')
+        self.assertEqual(self.api('movements',{'ref':'ADJ1','kind':'RECEIVE','sku':'S','location':'WH/A','qty':1})[1]['error'],'DUPLICATE_REFERENCE')
+        _,case=self.api('investigations?evidence_id='+str(eid))
+        self.assertEqual(case['current'],{'qty':9,'version':1})
+        self.assertEqual(case['resolution']['movement_ref'],'ADJ1')
+        self.assertEqual(case['event_total'],1)
+        self.assertEqual(case['events'][0]['ref'],'ADJ1')
+        self.assertEqual(self.api('deliveries/commit',self.order())[1]['reason'],'STALE_PHYSICAL_EVIDENCE')
+        self.count(9)
+        self.assertEqual(self.api('deliveries/commit',self.order())[1]['status'],'COMPLETED')
+        self.assertEqual(self.api('resolutions')[1][0]['note'],resolution['note'])
+        self.assertEqual(self.api('inventory')[1][0]['qty'],0)
+    def test_investigation_stale_tampering_and_authorization(self):
+        self.assertEqual(self.call('investigations?sku=S&location=WH/A')[0],401)
+        self.assertIsNone(self.api('investigations?sku=S&location=WH/A')[1]['evidence'])
+        _,start=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        _,ev=self.api('counts/submit',{'session_id':start['session_id'],'qty':9})
+        eid=ev['evidence_id']
+        self.assertEqual(self.call('investigations/resolve',{'evidence_id':eid,'ref':'X','note':'checked'})[0],401)
+        self.assertEqual(self.api('investigations?evidence_id=999999')[0],404)
+        self.assertEqual(self.api('investigations?evidence_id=oops')[0],400)
+        self.assertEqual(self.api('investigations/resolve',{'evidence_id':eid,'ref':'X','note':''})[1]['error'],'INVALID_NOTE')
+        self.api('movements',{'kind':'RECEIVE','ref':'R1','sku':'S','location':'WH/A','qty':2})
+        _,case=self.api('investigations?evidence_id='+str(eid))
+        self.assertEqual(case['event_total'],1)
+        self.assertEqual(case['events'][0]['dest_version'],1)
+        self.assertIn('STALE',[s['type'] for s in case['signals']])
+        self.assertEqual(self.api('investigations/resolve',{'evidence_id':eid,'ref':'X','note':'checked'})[1]['error'],'STALE_EVIDENCE')
+        self.assertEqual(self.api('inventory')[1][0]['qty'],12)
+        self.assertEqual(len(self.api('resolutions')[1]),0)
+    def test_seeded_demo_story_from_persisted_versions(self):
+        with veyra.transaction() as db:
+            db.execute('UPDATE stock SET qty=768,version=0 WHERE product_id=1 AND location_id=1')
+        self.assertEqual(self.count(761)['status'],'DISCREPANCY')
+        _,case=self.api('investigations?sku=S&location=WH/A')
+        self.assertEqual((case['evidence']['expected'],case['evidence']['observed'],case['evidence']['variance']),(768,761,-7))
+        eid=case['evidence']['id']
+        self.assertEqual(self.api('investigations/resolve',{'evidence_id':eid,'ref':'A1','note':'Physical bin verified, investigate missing 7'})[1]['version'],1)
+        self.assertEqual(self.count(761)['status'],'VERIFIED')
+        self.assertEqual(self.api('movements',{'ref':'R1','kind':'RECEIVE','sku':'S','location':'WH/A','qty':2})[0],200)
+        o=self.order('D1',qty=9)
+        self.assertEqual(self.api('deliveries/commit',o)[1]['reason'],'STALE_PHYSICAL_EVIDENCE')
+        self.assertEqual(self.count(763)['status'],'VERIFIED')
+        self.assertEqual(self.api('deliveries/commit',o)[1]['remaining'],754)
+        self.assertEqual(self.api('inventory')[1][0]['version'],3)
+        self.assertEqual([m['ref'] for m in self.api('movements')[1]],['D1','R1','A1'])
+    def test_open_count_survives_new_connection_and_is_actor_scoped(self):
+        _,started=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        self.assertEqual(self.api('counts/open')[1]['session_id'],started['session_id'])
+        _,other=self.call('signup',{'username':'second','password':'password1234'})
+        self.assertIsNone(self.call('counts/open',token=other['token'])[1])
+        self.assertEqual(self.call('counts/submit',{'session_id':started['session_id'],'qty':9},other['token'])[0],403)
+        self.assertEqual(self.api('counts/submit',{'session_id':started['session_id'],'qty':9})[0],200)
+        self.assertIsNone(self.api('counts/open')[1])
+    def test_concurrent_resolution_only_one_adjustment(self):
+        _,start=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        _,ev=self.api('counts/submit',{'session_id':start['session_id'],'qty':9})
+        data={'evidence_id':ev['evidence_id'],'ref':'A1','note':'verified manually'}
+        barrier=threading.Barrier(3);out=[]
+        def run():barrier.wait();out.append(self.api('investigations/resolve',data))
+        a=threading.Thread(target=run);b=threading.Thread(target=run);a.start();b.start();barrier.wait();a.join();b.join()
+        self.assertEqual(sorted(status for status,_ in out),[200,409])
+        self.assertEqual(len(self.api('resolutions')[1]),1)
+        self.assertEqual(len(self.api('movements')[1]),1)
+        self.assertEqual(self.api('inventory')[1][0]['qty'],9)
     def test_concurrent_commits_one_movement(self):
         self.count();o=self.order();barrier=threading.Barrier(3);out=[]
         def run():barrier.wait();out.append(self.api('deliveries/commit',o))

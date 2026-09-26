@@ -7,7 +7,7 @@ Veyra is a **local inventory application** for the Odoo × GCET StockSense chall
 Requires Python 3.11+; no third-party packages, internet, cloud account or external DB. On Windows PowerShell or bash from the project root:
 
 ```sh
-python seed.py             # optional: only on a new DB, initializes S/WH/A=10 at v0
+python seed.py             # optional: only on a new DB, initializes S/WH/A=768 at v0
 python veyra.py            # http://127.0.0.1:8000
 ```
 
@@ -15,20 +15,22 @@ First open the URL and create an account (username 3+ chars; password 8+ chars).
 
 ## Demo (browser)
 
-1. Run seed before signup. Sign up. In **Physical Verification**, start S / WH/A, submit count 10 (v0).
-2. In **Receipts**, receive SKU S, location WH/A, quantity 2, unique reference R1 and supplier. Inventory shows 12 / v1.
-3. In **Deliveries**, order D1, SKU S, WH/A, quantity 9. Check delivery, then **Attempt delivery**. Backend records a blocked commit: `STALE_PHYSICAL_EVIDENCE`, evidence v0, current v1, action RECOUNT.
-4. Start a new count of S at WH/A. Submit observed 12 at v1. Return to Deliveries; check D1 and attempt again. Exactly one DELIVER movement commits, ending stock 3 / v2. Inspect **Evidence Holds** and **Audit** for both decisions and the movements.
+1. Run seed before signup. Sign up. Open **Inventory → Investigate** for S / WH/A. There is no count yet. In **Physical Verification**, start S / WH/A, submit **761**. The investigation shows expected **768**, observed **761**, variance **-7**, and no recorded movement explaining the difference. This is not an automatic attribution.
+2. Check the bin and records yourself. In **Investigation**, enter reference `A1` and a real note, then explicitly adjust to 761. Audit records the adjustment and note; the prior count is now stale. Recount 761 to verify at v1.
+3. In **Receipts**, receive S at WH/A, quantity **2**, unique reference `R1` and supplier. Current stock is **763 / v2**. Open the earlier verified count from **Physical Verification → Evidence history** to see the receipt scoped to the bin.
+4. In **Deliveries**, order `D1`, S, WH/A, quantity 9. Check then attempt delivery. The backend records `STALE_PHYSICAL_EVIDENCE`, evidence v1, current v2, action RECOUNT.
+5. Recount 763 at v2. Return to Deliveries, check D1 and attempt again. Exactly one DELIVER movement commits, ending stock **754 / v3**. Inspect **Evidence Holds** and **Audit** for decisions, movements and resolution.
 
-Subsequent deliveries need new evidence because delivery itself changes the inventory version. Stock adjustments are explicit; submitting a count never changes stock.
+Subsequent deliveries need new evidence because delivery itself changes the inventory version. Count sessions can be resumed after reload by the actor who started them. Investigations are based on persisted count snapshots and version-scoped movements, not AI or claims of proven causality. Stock adjustments are explicit; submitting a count never changes stock.
 
 ## Tests
 
 ```sh
 python -m unittest discover -s tests -v
+node tests/browser_smoke.mjs   # optional: needs Node 22+ and Chrome (CHROME_PATH overrides default)
 ```
 
-Tests use an isolated temporary SQLite database and real localhost HTTP server. No mock database or static JSON store. See `docs/REQUIREMENTS.md`, `docs/ARCHITECTURE.md`, `docs/DATABASE.md`, and `docs/API.md`.
+Tests use an isolated temporary SQLite database and real localhost HTTP server. The optional browser smoke runs the full seeded discrepancy → resolution → receipt → stale hold → recount → delivery flow in headless Chrome with a temporary browser profile and database. No mock database or static JSON store. See `docs/REQUIREMENTS.md`, `docs/ARCHITECTURE.md`, `docs/DATABASE.md`, and `docs/API.md`.
 
 ## Known gaps (not claimed complete)
 
