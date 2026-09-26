@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY, ref TEXT UNIQUE NOT
 CREATE TABLE IF NOT EXISTS count_sessions(id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), captured_version INTEGER NOT NULL, captured_qty INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','SUBMITTED','CANCELED')));
 CREATE TABLE IF NOT EXISTS evidence(id INTEGER PRIMARY KEY, session_id INTEGER UNIQUE NOT NULL REFERENCES count_sessions(id), product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), observed_qty INTEGER NOT NULL CHECK(observed_qty>=0), captured_version INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL, submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS resolutions(id INTEGER PRIMARY KEY, evidence_id INTEGER NOT NULL UNIQUE REFERENCES evidence(id), movement_ref TEXT NOT NULL UNIQUE REFERENCES movements(ref), note TEXT NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS deliveries(ref TEXT PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), qty INTEGER NOT NULL CHECK(qty>0), contact TEXT, state TEXT NOT NULL CHECK(state IN ('PENDING','DONE','CANCELED')), actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS deliveries(ref TEXT PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), qty INTEGER NOT NULL CHECK(qty>0), contact TEXT, state TEXT NOT NULL CHECK(state IN ('DRAFT','READY','PICKING','PICKED','PACKING','PACKED','DONE')), picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty>=0 AND picked_qty<=qty), packed_qty INTEGER NOT NULL DEFAULT 0 CHECK(packed_qty>=0 AND packed_qty<=picked_qty), actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS delivery_events(id INTEGER PRIMARY KEY, ref TEXT NOT NULL REFERENCES deliveries(ref), from_state TEXT, to_state TEXT NOT NULL, action TEXT NOT NULL, qty_delta INTEGER NOT NULL DEFAULT 0, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), inventory_version INTEGER NOT NULL, evidence_id INTEGER REFERENCES evidence(id), actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, ref TEXT NOT NULL REFERENCES deliveries(ref), stage TEXT NOT NULL CHECK(stage IN ('PREFLIGHT','COMMIT')), status TEXT NOT NULL, reason TEXT NOT NULL, evidence_version INTEGER, current_version INTEGER NOT NULL, evidence_id INTEGER REFERENCES evidence(id), stock_qty INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS ix_movements_product ON movements(product_id,created_at);
 CREATE INDEX IF NOT EXISTS ix_evidence_scope ON evidence(product_id,location_id,captured_version);
@@ -54,7 +55,49 @@ def connect():
 
 def init():
     db=connect()
-    try: db.executescript(SCHEMA)
+    try:
+        # Existing PENDING orders are drafts; never infer that picking or packing happened.
+        legacy=one(db,"SELECT name FROM sqlite_master WHERE type='table' AND name='deliveries'")
+        if legacy and 'picked_qty' not in [r['name'] for r in db.execute('PRAGMA table_info(deliveries)')]:
+            db.execute('PRAGMA foreign_keys=OFF')
+            try:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("""CREATE TABLE deliveries_new(ref TEXT PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), qty INTEGER NOT NULL CHECK(qty>0), contact TEXT, state TEXT NOT NULL CHECK(state IN ('DRAFT','READY','PICKING','PICKED','PACKING','PACKED','DONE')), picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty>=0 AND picked_qty<=qty), packed_qty INTEGER NOT NULL DEFAULT 0 CHECK(packed_qty>=0 AND packed_qty<=picked_qty), actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+                db.execute("INSERT INTO deliveries_new(ref,product_id,location_id,qty,contact,state,actor,created_at) SELECT ref,product_id,location_id,qty,contact,CASE WHEN state='DONE' THEN 'DONE' ELSE 'DRAFT' END,actor,created_at FROM deliveries")
+                db.execute('DROP TABLE deliveries')
+                db.execute('ALTER TABLE deliveries_new RENAME TO deliveries')
+                db.commit()
+            except Exception:
+                db.rollback(); raise
+            finally:
+                db.execute('PRAGMA foreign_keys=ON')
+        db.executescript(SCHEMA)
+        # Additive P2 migration: retain legacy header fields and historical foreign keys.
+        # Each historical order becomes one line; no pick/pack history is invented.
+        with db:
+            db.execute('''CREATE TABLE IF NOT EXISTS delivery_lines(
+                id INTEGER PRIMARY KEY, ref TEXT NOT NULL REFERENCES deliveries(ref),
+                product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id),
+                qty INTEGER NOT NULL CHECK(qty>0), picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty>=0 AND picked_qty<=qty),
+                packed_qty INTEGER NOT NULL DEFAULT 0 CHECK(packed_qty>=0 AND packed_qty<=picked_qty),
+                UNIQUE(ref,product_id,location_id))''')
+            db.execute('''INSERT INTO delivery_lines(ref,product_id,location_id,qty,picked_qty,packed_qty)
+                SELECT ref,product_id,location_id,qty,picked_qty,packed_qty FROM deliveries o
+                WHERE NOT EXISTS (SELECT 1 FROM delivery_lines WHERE ref=o.ref)''')
+            for table, columns in {'deliveries':{'updated_at':'TEXT','destination':'TEXT'},
+                    'movements':{'delivery_ref':'TEXT REFERENCES deliveries(ref)','line_id':'INTEGER REFERENCES delivery_lines(id)'},
+                    'delivery_events':{'line_id':'INTEGER REFERENCES delivery_lines(id)'},
+                    'decisions':{'line_id':'INTEGER REFERENCES delivery_lines(id)'}}.items():
+                existing={r['name'] for r in db.execute('PRAGMA table_info('+table+')')}
+                for column, definition in columns.items():
+                    if column not in existing: db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            db.execute('''UPDATE movements SET delivery_ref=ref,
+                line_id=(SELECT id FROM delivery_lines WHERE delivery_lines.ref=movements.ref ORDER BY id LIMIT 1)
+                WHERE kind='DELIVER' AND delivery_ref IS NULL AND EXISTS
+                (SELECT 1 FROM deliveries WHERE deliveries.ref=movements.ref)''')
+            db.execute('CREATE INDEX IF NOT EXISTS ix_delivery_lines_ref ON delivery_lines(ref)')
+            db.execute('CREATE INDEX IF NOT EXISTS ix_movements_delivery ON movements(delivery_ref,line_id)')
+        if db.execute('PRAGMA foreign_key_check').fetchone(): raise RuntimeError('Database foreign key check failed')
     finally: db.close()
 
 @contextmanager
@@ -212,9 +255,12 @@ def investigation(db, query):
     where='m.product_id=? AND ((m.source_id=? AND m.source_version>? AND m.source_version<=?) OR (m.dest_id=? AND m.dest_version>? AND m.dest_version<=?))'
     args=(p['id'],l['id'],anchor,s['version'],l['id'],anchor,s['version'])
     total=one(db,'SELECT COUNT(*) n FROM movements m WHERE '+where,args)['n']
-    events=rows(db,'SELECT m.ref,m.kind,m.qty,m.created_at,m.source_version,m.dest_version,sw.code || "/" || sl.code source,dw.code || "/" || dl.code destination,u.username actor_name FROM movements m JOIN users u ON u.id=m.actor LEFT JOIN locations sl ON sl.id=m.source_id LEFT JOIN warehouses sw ON sw.id=sl.warehouse_id LEFT JOIN locations dl ON dl.id=m.dest_id LEFT JOIN warehouses dw ON dw.id=dl.warehouse_id WHERE '+where+' ORDER BY m.id DESC LIMIT 50',args)
+    events=rows(db,'SELECT m.ref,m.delivery_ref,m.line_id,m.kind,m.qty,m.created_at,m.source_version,m.dest_version,sw.code || "/" || sl.code source,dw.code || "/" || dl.code destination,u.username actor_name FROM movements m JOIN users u ON u.id=m.actor LEFT JOIN locations sl ON sl.id=m.source_id LEFT JOIN warehouses sw ON sw.id=sl.warehouse_id LEFT JOIN locations dl ON dl.id=m.dest_id LEFT JOIN warehouses dw ON dw.id=dl.warehouse_id WHERE '+where+' ORDER BY m.id DESC LIMIT 50',args)
     resolution=one(db,'SELECT r.id,r.movement_ref,r.note,r.created_at,u.username actor_name FROM resolutions r JOIN users u ON u.id=r.actor WHERE r.evidence_id=?',(e['id'],))
     signals=[]
+    current_counts=rows(db,'SELECT id,observed_qty FROM evidence WHERE product_id=? AND location_id=? AND captured_version=? ORDER BY id DESC',(p['id'],l['id'],s['version']))
+    if len({x['observed_qty'] for x in current_counts})>1:
+        signals.append({'type':'CONFLICTING_COUNTS','text':'Observed counts at current v'+str(s['version'])+' disagree: '+', '.join('#'+str(x['id'])+' = '+str(x['observed_qty']) for x in current_counts[:10])+('. Review additional counts in Evidence history.' if len(current_counts)>10 else '.')+' Investigate the bin and records; an explicit adjustment to a checked quantity advances the version, then recount. Do not assume either observation is correct.'})
     if e['captured_version']!=s['version']:
         signals.append({'type':'STALE','text':'Recorded inventory changed after this count. The observation cannot authorize a delivery; recount at the current version.'})
     if e['observed_qty']!=e['captured_qty']:
@@ -226,7 +272,7 @@ def investigation(db, query):
         if any(m['kind']=='ADJUST' for m in events):
             signals.append({'type':'ADJUSTMENT_RECORDED','text':'An explicit adjustment changed the ledger. Review its reference and resolution note where available.'})
     elif e['observed_qty']!=e['captured_qty']:
-        signals.append({'type':'UNEXPLAINED','text':'No recorded movement in this version window explains the physical variance. Check the bin and transaction records.'})
+        signals.append({'type':'UNEXPLAINED','text':'No recorded movement appears in this version window. The physical variance remains unexplained; check the bin and transaction records.'})
     if resolution: signals.append({'type':'RESOLVED','text':'An explicit adjustment was logged. A new agreeing count is still required for delivery.'})
     if not signals: signals.append({'type':'AGREES','text':'The recorded and observed quantities agreed at count submission. This does not prove physical truth.'})
     return {'sku':p['sku'],'name':p['name'],'location':l['warehouse']+'/'+l['code'],'current':{'qty':s['qty'],'version':s['version']},'evidence':{'id':e['id'],'expected':e['captured_qty'],'observed':e['observed_qty'],'variance':e['observed_qty']-e['captured_qty'],'captured_version':e['captured_version'],'status_at_submission':e['status'],'submitted_at':e['submitted_at']},'last_verified':previous,'events':events,'event_total':total,'signals':signals,'resolution':resolution}
@@ -250,7 +296,7 @@ def resolve(db,data,actor):
     db.execute('INSERT INTO resolutions(evidence_id,movement_ref,note,actor) VALUES(?,?,?,?)',(eid,ref,note,actor))
     return {'status':'ADJUSTED','ref':ref,'evidence_id':eid,'previous':s['qty'],'current':e['observed_qty'],'version':version,'required_action':'RECOUNT'}
 
-def decide(db,ref,p,l,s,qty,actor,stage):
+def decide(db,ref,p,l,s,qty,actor,stage,line_id=None):
     all_e=rows(db,'SELECT * FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC',(p['id'],l['id']))
     latest=all_e[0] if all_e else None
     current=[e for e in all_e if e['captured_version']==s['version']]
@@ -262,32 +308,139 @@ def decide(db,ref,p,l,s,qty,actor,stage):
     else: reason='VERIFIED'
     e=current[0] if current else latest
     status='ALLOWED' if reason=='VERIFIED' else 'BLOCKED'
-    db.execute('INSERT INTO decisions(ref,stage,status,reason,evidence_version,current_version,evidence_id,stock_qty,actor) VALUES(?,?,?,?,?,?,?,?,?)',(ref,stage,status,reason,e['captured_version'] if e else None,s['version'],e['id'] if e else None,s['qty'],actor))
-    return {'status':status,'reason':reason,'sku':p['sku'],'location':l['warehouse']+'/'+l['code'],'evidence_version':e['captured_version'] if e else None,'current_version':s['version'],'recorded':s['qty'],'requested':qty,'required_action':'RECOUNT' if reason!='INSUFFICIENT_STOCK' and status=='BLOCKED' else ('RECEIVE_STOCK' if status=='BLOCKED' else None),'ref':ref,'stage':stage}
+    db.execute('INSERT INTO decisions(ref,stage,status,reason,evidence_version,current_version,evidence_id,stock_qty,actor,line_id) VALUES(?,?,?,?,?,?,?,?,?,?)',(ref,stage,status,reason,e['captured_version'] if e else None,s['version'],e['id'] if e else None,s['qty'],actor,line_id))
+    return {'status':status,'reason':reason,'sku':p['sku'],'location':l['warehouse']+'/'+l['code'],'evidence_version':e['captured_version'] if e else None,'current_version':s['version'],'recorded':s['qty'],'requested':qty,'required_action':('RECEIVE_STOCK' if reason=='INSUFFICIENT_STOCK' else 'INVESTIGATE' if reason in ('DISCREPANCY','CONFLICTING_PHYSICAL_EVIDENCE') else 'RECOUNT') if status=='BLOCKED' else None,'ref':ref,'stage':stage}
+
+def delivery_event(db,order,actor,action,from_state,to_state,version,evidence_id=None,delta=0,line=None):
+    line=line or order
+    db.execute('INSERT INTO delivery_events(ref,from_state,to_state,action,qty_delta,product_id,location_id,inventory_version,evidence_id,actor,line_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+               (order['ref'],from_state,to_state,action,delta,line['product_id'],line['location_id'],version,evidence_id,actor,line.get('id')))
+
+def delivery_lines(db,ref):
+    return rows(db,'''SELECT dl.*,p.sku,p.name product,w.code || '/' || l.code location,
+        s.qty available_qty,s.version inventory_version FROM delivery_lines dl
+        JOIN products p ON p.id=dl.product_id JOIN locations l ON l.id=dl.location_id
+        JOIN warehouses w ON w.id=l.warehouse_id JOIN stock s ON s.product_id=dl.product_id AND s.location_id=dl.location_id
+        WHERE dl.ref=? ORDER BY dl.id''',(ref,))
+
+def delivery_step(db,data,actor):
+    ref=text(data.get('ref'),'ref',80)
+    action=text(data.get('action'),'action',40).upper()
+    order=one(db,'SELECT * FROM deliveries WHERE ref=?',(ref,))
+    if not order: raise Failure('INVALID_DELIVERY',404)
+    lines=delivery_lines(db,ref)
+    if not lines: raise Failure('INVALID_DELIVERY',409)
+    transitions={'READY':('DRAFT','READY'),'START_PICKING':('READY','PICKING'),
+                 'COMPLETE_PICKING':('PICKING','PICKED'),'START_PACKING':('PICKED','PACKING'),
+                 'COMPLETE_PACKING':('PACKING','PACKED')}
+    delta=0
+    if action in ('PICK','PACK'):
+        if order['state']!=('PICKING' if action=='PICK' else 'PACKING'): raise Failure('INVALID_STATE_TRANSITION',409)
+        if len(lines)>1:
+            lid=integer(data.get('line_id'),'line_id',1)
+            line=next((x for x in lines if x['id']==lid),None)
+            if not line: raise Failure('INVALID_DELIVERY_LINE',404)
+        else:
+            line=lines[0]
+            if 'line_id' in data and integer(data['line_id'],'line_id',1)!=line['id']: raise Failure('INVALID_DELIVERY_LINE',404)
+        delta=integer(data.get('qty'),'qty',1)
+        column='picked_qty' if action=='PICK' else 'packed_qty'
+        limit=line['qty'] if action=='PICK' else line['picked_qty']
+        if line[column]+delta>limit: raise Failure('QUANTITY_EXCEEDS_REMAINING',409)
+        if action=='PICK' and line[column]+delta>line['available_qty']: raise Failure('INSUFFICIENT_STOCK',409)
+        db.execute('UPDATE delivery_lines SET '+column+'='+column+'+? WHERE id=?',(delta,line['id']))
+        # Legacy header mirrors the first line for old clients.
+        if line['id']==lines[0]['id']: db.execute('UPDATE deliveries SET '+column+'='+column+'+? WHERE ref=?',(delta,ref))
+        next_state=order['state']
+    elif action in transitions:
+        required,next_state=transitions[action]
+        if order['state']!=required: raise Failure('INVALID_STATE_TRANSITION',409)
+        if action=='COMPLETE_PICKING' and any(x['picked_qty']!=x['qty'] for x in lines): raise Failure('PICKING_INCOMPLETE',409)
+        if action=='COMPLETE_PACKING' and any(x['packed_qty']!=x['qty'] for x in lines): raise Failure('PACKING_INCOMPLETE',409)
+        if action=='READY' and any(x['available_qty']<x['qty'] for x in lines): raise Failure('INSUFFICIENT_STOCK',409)
+        line=lines[0]
+        db.execute('UPDATE deliveries SET state=? WHERE ref=?',(next_state,ref))
+    else: raise Failure('INVALID_ACTION')
+    db.execute('UPDATE deliveries SET updated_at=CURRENT_TIMESTAMP WHERE ref=?',(ref,))
+    delivery_event(db,order,actor,action,order['state'],next_state,line['inventory_version'],delta=delta,line=line)
+    return {'ref':ref,'status':next_state,'line_id':line['id'],
+            'picked_qty':line['picked_qty']+(delta if action=='PICK' else 0),
+            'packed_qty':line['packed_qty']+(delta if action=='PACK' else 0)}
 
 def delivery(db,data,actor,commit=False):
     ref=text(data.get('ref'),'ref',80)
-    p,l,s=scope(db,data.get('sku'),data.get('location'))
-    qty=integer(data.get('qty'),'qty',1)
-    contact=data.get('contact')
-    if contact == '': contact=None
-    if contact is not None: contact=text(contact,'contact')
     order=one(db,'SELECT * FROM deliveries WHERE ref=?',(ref,))
+    supplied=data.get('lines')
+    if supplied is not None:
+        if not isinstance(supplied,list) or not supplied or len(supplied)>100: raise Failure('INVALID_LINES')
+        if any(not isinstance(x,dict) for x in supplied): raise Failure('INVALID_LINES')
+    if not order and commit: raise Failure('INVALID_STATE_TRANSITION',409)
     if not order:
+        contact=data.get('contact') or None
+        if contact is not None: contact=text(contact,'contact')
+        destination=data.get('destination') or None
+        if destination is not None: destination=text(destination,'destination')
+        specs=supplied if supplied is not None else [data]
+        resolved=[]
+        for item in specs:
+            p,l,s=scope(db,item.get('sku'),item.get('location'))
+            qty=integer(item.get('qty'),'qty',1)
+            if any(x[0]['id']==p['id'] and x[1]['id']==l['id'] for x in resolved): raise Failure('DUPLICATE_DELIVERY_LINE',409)
+            resolved.append((p,l,s,qty))
         if one(db,'SELECT id FROM movements WHERE ref=?',(ref,)): raise Failure('DUPLICATE_REFERENCE',409)
-        db.execute('INSERT INTO deliveries(ref,product_id,location_id,qty,contact,state,actor) VALUES(?,?,?,?,?,?,?)',(ref,p['id'],l['id'],qty,contact,'PENDING',actor))
-    elif (order['product_id'],order['location_id'],order['qty'],order['contact'])!=(p['id'],l['id'],qty,contact):
-        raise Failure('DUPLICATE_REFERENCE',409)
-    elif order['state']=='DONE':
-        return {'status':'COMPLETED','reason':'ALREADY_COMPLETED','ref':ref,'movement_ref':ref}
-    elif order['state']!='PENDING': raise Failure('INVALID_STATE_TRANSITION',409)
-    result=decide(db,ref,p,l,s,qty,actor,'COMMIT' if commit else 'PREFLIGHT')
-    if commit and result['status']=='ALLOWED':
-        version=stock_change(db,p,l,-qty)
-        db.execute('INSERT INTO movements(ref,kind,product_id,source_id,qty,source_version,actor,contact) VALUES(?,?,?,?,?,?,?,?)',(ref,'DELIVER',p['id'],l['id'],qty,version,actor,contact))
-        db.execute("UPDATE deliveries SET state='DONE' WHERE ref=?",(ref,))
-        result.update(status='COMPLETED',remaining=s['qty']-qty,movement_ref=ref)
-    return result
+        p,l,s,qty=resolved[0]
+        db.execute('INSERT INTO deliveries(ref,product_id,location_id,qty,contact,state,actor,destination,updated_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)',(ref,p['id'],l['id'],qty,contact,'DRAFT',actor,destination))
+        for p,l,s,qty in resolved:
+            cur=db.execute('INSERT INTO delivery_lines(ref,product_id,location_id,qty) VALUES(?,?,?,?)',(ref,p['id'],l['id'],qty))
+            line={'id':cur.lastrowid,'product_id':p['id'],'location_id':l['id']}
+            delivery_event(db,{'ref':ref},actor,'CREATE',None,'DRAFT',s['version'],line=line)
+        order=one(db,'SELECT * FROM deliveries WHERE ref=?',(ref,))
+    lines=delivery_lines(db,ref)
+    if not lines: raise Failure('INVALID_DELIVERY',409)
+    if supplied is not None:
+        if len(supplied)!=len(lines): raise Failure('DUPLICATE_REFERENCE',409)
+        for item,line in zip(supplied,lines):
+            p,l,_=scope(db,item.get('sku'),item.get('location'))
+            if (p['id'],l['id'],integer(item.get('qty'),'qty',1))!=(line['product_id'],line['location_id'],line['qty']): raise Failure('DUPLICATE_REFERENCE',409)
+    elif any(k in data for k in ('sku','location','qty')):
+        first=lines[0]
+        p,l,_=scope(db,data.get('sku'),data.get('location'))
+        if len(lines)!=1 or (p['id'],l['id'],integer(data.get('qty'),'qty',1))!=(first['product_id'],first['location_id'],first['qty']): raise Failure('DUPLICATE_REFERENCE',409)
+    if 'contact' in data and (data['contact'] or None)!=order['contact']: raise Failure('DUPLICATE_REFERENCE',409)
+    if 'destination' in data and (data['destination'] or None)!=order['destination']: raise Failure('DUPLICATE_REFERENCE',409)
+    if order['state']=='DONE':
+        if commit: return {'status':'COMPLETED','reason':'ALREADY_COMPLETED','ref':ref,'movement_ref':ref}
+        raise Failure('INVALID_STATE_TRANSITION',409)
+    if commit and (order['state']!='PACKED' or any(x['picked_qty']!=x['qty'] or x['packed_qty']!=x['qty'] for x in lines)):
+        raise Failure('INVALID_STATE_TRANSITION',409)
+    results=[]
+    # Every line is evaluated under the same writer lock; no stock row is touched until ALL pass.
+    for line in lines:
+        p={'id':line['product_id'],'sku':line['sku']}
+        warehouse,code=line['location'].split('/',1)
+        l={'id':line['location_id'],'warehouse':warehouse,'code':code}
+        s={'qty':line['available_qty'],'version':line['inventory_version']}
+        r=decide(db,ref,p,l,s,line['qty'],actor,'COMMIT' if commit else 'PREFLIGHT',line['id'])
+        r['line_id']=line['id']; results.append(r)
+    if commit and all(r['status']=='ALLOWED' for r in results):
+        for i,(line,r) in enumerate(zip(lines,results)):
+            p={'id':line['product_id']};l={'id':line['location_id']}
+            version=stock_change(db,p,l,-line['qty'])
+            # First line retains the historical reference; other refs are uniquely scoped to this line.
+            mref=ref if i==0 else ref+'#'+str(line['id'])
+            db.execute('INSERT INTO movements(ref,kind,product_id,source_id,qty,source_version,actor,contact,delivery_ref,line_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (mref,'DELIVER',p['id'],l['id'],line['qty'],version,actor,order['contact'],ref,line['id']))
+            delivery_event(db,order,actor,'COMMIT','PACKED','DONE',line['inventory_version'],
+                           one(db,'SELECT evidence_id FROM decisions WHERE ref=? AND line_id=? ORDER BY id DESC LIMIT 1',(ref,line['id']))['evidence_id'],line=line)
+            r.update(remaining=line['available_qty']-line['qty'],movement_ref=mref)
+        db.execute("UPDATE deliveries SET state='DONE',updated_at=CURRENT_TIMESTAMP WHERE ref=?",(ref,))
+    status='BLOCKED' if any(r['status']=='BLOCKED' for r in results) else 'COMPLETED' if commit else 'ALLOWED'
+    if len(results)==1:
+        result=results[0]
+        if status=='COMPLETED': result['status']='COMPLETED'
+        return result
+    return {'ref':ref,'status':status,'lines':results,
+            'reason':next((r['reason'] for r in results if r['status']=='BLOCKED'),'VERIFIED')}
 
 def list_data(db,name,query):
     if name=='inventory':
@@ -297,13 +450,22 @@ def list_data(db,name,query):
             if query.get(k): sql+=' AND '+col+(' LIKE ?' if k=='search' else '=?');args.append('%'+query[k][0]+'%' if k=='search' else query[k][0])
         return rows(db,sql+' ORDER BY p.sku,w.code,l.code',args)
     if name=='movements': return rows(db,'SELECT m.*,p.sku,sw.code || "/" || sl.code source,dw.code || "/" || dl.code destination,u.username actor_name FROM movements m JOIN products p ON p.id=m.product_id JOIN users u ON u.id=m.actor LEFT JOIN locations sl ON sl.id=m.source_id LEFT JOIN warehouses sw ON sw.id=sl.warehouse_id LEFT JOIN locations dl ON dl.id=m.dest_id LEFT JOIN warehouses dw ON dw.id=dl.warehouse_id ORDER BY m.id DESC LIMIT 200')
-    if name=='decisions': return rows(db,'SELECT d.*,p.sku,w.code || "/" || l.code location FROM decisions d JOIN deliveries o ON o.ref=d.ref JOIN products p ON p.id=o.product_id JOIN locations l ON l.id=o.location_id JOIN warehouses w ON w.id=l.warehouse_id ORDER BY d.id DESC LIMIT 200')
+    if name=='decisions': return rows(db,'SELECT d.*,p.sku,w.code || "/" || l.code location,u.username actor_name FROM decisions d JOIN users u ON u.id=d.actor JOIN deliveries o ON o.ref=d.ref JOIN delivery_lines dl ON dl.id=COALESCE(d.line_id,(SELECT id FROM delivery_lines WHERE ref=d.ref ORDER BY id LIMIT 1)) JOIN products p ON p.id=dl.product_id JOIN locations l ON l.id=dl.location_id JOIN warehouses w ON w.id=l.warehouse_id ORDER BY d.id DESC LIMIT 200')
     if name=='evidence': return rows(db,'SELECT e.*,p.sku,w.code || "/" || l.code location,u.username actor_name FROM evidence e JOIN products p ON p.id=e.product_id JOIN locations l ON l.id=e.location_id JOIN warehouses w ON w.id=l.warehouse_id JOIN users u ON u.id=e.actor ORDER BY e.id DESC LIMIT 200')
-    if name=='deliveries': return rows(db,'SELECT o.*,p.sku,w.code || "/" || l.code location FROM deliveries o JOIN products p ON p.id=o.product_id JOIN locations l ON l.id=o.location_id JOIN warehouses w ON w.id=l.warehouse_id ORDER BY o.created_at DESC')
+    if name=='deliveries':
+        orders=rows(db,'SELECT o.*,p.sku,p.name product,w.code || "/" || l.code location,s.qty available_qty,s.version inventory_version FROM deliveries o JOIN products p ON p.id=o.product_id JOIN locations l ON l.id=o.location_id JOIN warehouses w ON w.id=l.warehouse_id JOIN stock s ON s.product_id=o.product_id AND s.location_id=o.location_id ORDER BY o.created_at DESC,o.ref DESC')
+        for o in orders:
+            o['lines']=delivery_lines(db,o['ref'])
+            for line in o['lines']:
+                e=one(db,'SELECT captured_version,observed_qty FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC LIMIT 1',(line['product_id'],line['location_id']))
+                conflict=one(db,'SELECT COUNT(DISTINCT observed_qty) n FROM evidence WHERE product_id=? AND location_id=? AND captured_version=?',(line['product_id'],line['location_id'],line['inventory_version']))['n'] if e and e['captured_version']==line['inventory_version'] else 0
+                line['evidence']='MISSING' if not e else 'STALE' if e['captured_version']!=line['inventory_version'] else 'CONFLICT' if conflict>1 else 'DISCREPANCY' if e['observed_qty']!=line['available_qty'] else 'CURRENT'
+        return orders
+    if name=='delivery-events': return rows(db,'SELECT e.id,e.ref,e.from_state,e.to_state,e.action,e.qty_delta,e.inventory_version,e.evidence_id,e.created_at,p.sku,w.code || "/" || l.code location,u.username actor_name FROM delivery_events e JOIN products p ON p.id=e.product_id JOIN locations l ON l.id=e.location_id JOIN warehouses w ON w.id=l.warehouse_id JOIN users u ON u.id=e.actor ORDER BY e.id DESC LIMIT 200')
     if name=='investigations': return investigation(db,query)
     if name=='resolutions': return rows(db,'SELECT r.*,e.observed_qty,p.sku,w.code || "/" || l.code location,u.username actor_name FROM resolutions r JOIN evidence e ON e.id=r.evidence_id JOIN products p ON p.id=e.product_id JOIN locations l ON l.id=e.location_id JOIN warehouses w ON w.id=l.warehouse_id JOIN users u ON u.id=r.actor ORDER BY r.id DESC LIMIT 200')
     if name=='dashboard':
-        return {'products':one(db,'SELECT COUNT(*) n FROM products')['n'],'units':one(db,'SELECT COALESCE(SUM(qty),0) n FROM stock')['n'],'low_stock':one(db,'SELECT COUNT(*) n FROM stock s JOIN products p ON p.id=s.product_id WHERE s.qty<=p.reorder_point')['n'],'pending_deliveries':one(db,"SELECT COUNT(*) n FROM deliveries WHERE state='PENDING'")['n'],'held_decisions':one(db,"SELECT COUNT(*) n FROM decisions WHERE status='BLOCKED'")['n']}
+        return {'products':one(db,'SELECT COUNT(*) n FROM products')['n'],'units':one(db,'SELECT COALESCE(SUM(qty),0) n FROM stock')['n'],'low_stock':one(db,'SELECT COUNT(*) n FROM stock s JOIN products p ON p.id=s.product_id WHERE s.qty<=p.reorder_point')['n'],'pending_deliveries':one(db,"SELECT COUNT(*) n FROM deliveries WHERE state!='DONE'")['n'],'held_decisions':one(db,"SELECT COUNT(*) n FROM decisions WHERE status='BLOCKED'")['n']}
     if name in ('products','warehouses','locations','categories'):
         return rows(db,{'products':'SELECT p.*,c.name category FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.sku','warehouses':'SELECT * FROM warehouses ORDER BY code','locations':'SELECT l.*,w.code warehouse FROM locations l JOIN warehouses w ON w.id=l.warehouse_id ORDER BY w.code,l.code','categories':'SELECT * FROM categories ORDER BY name'}[name])
     raise Failure('INVALID_RESOURCE',404)
@@ -343,6 +505,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif name=='investigations/resolve':result=resolve(db,data,actor)
                 elif name=='counts/start':result=start_count(db,data,actor)
                 elif name=='counts/submit':result=submit_count(db,data,actor)
+                elif name=='deliveries/step':result=delivery_step(db,data,actor)
                 elif name in ('deliveries/preflight','deliveries/commit'):result=delivery(db,data,actor,name.endswith('commit'))
                 else:raise Failure('NOT_FOUND',404)
         self.respond(200,result)

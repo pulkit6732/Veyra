@@ -10,4 +10,6 @@ with veyra.transaction() as db:
         db.execute("INSERT INTO warehouses(code,name) VALUES('WH','Main warehouse')")
         db.execute("INSERT INTO locations(warehouse_id,code,name) VALUES(1,'A','Bin A')")
         db.execute('INSERT INTO stock(product_id,location_id,qty,version) VALUES(1,1,768,0)')
-        print('Demo initialized: S / WH/A = 768 at v0. Sign up in the browser.')
+        db.execute("INSERT INTO products(sku,name,category_id,reorder_point) VALUES('B','Brass bracket',1,2)")
+        db.execute('INSERT INTO stock(product_id,location_id,qty,version) VALUES(2,1,5,0)')
+        print('Demo initialized: S / WH/A = 768 and B / WH/A = 5 at v0. Sign up in the browser.')
