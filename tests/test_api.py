@@ -97,6 +97,26 @@ class API(unittest.TestCase):
         self.assertEqual(self.api('inventory')[1][0]['qty'],9)
         self.assertEqual(self.api('deliveries/commit',self.order())[1]['reason'],'STALE_PHYSICAL_EVIDENCE')
         self.count(9);self.assertEqual(self.api('deliveries/commit',self.order())[1]['status'],'COMPLETED')
+    def test_latest_agreeing_count_cannot_silently_clear_conflict_but_can_be_acknowledged(self):
+        self.count(9)
+        latest=self.count(10)
+        eid=latest['evidence_id']
+        self.assertEqual(latest['status'],'VERIFIED')
+        self.prepare(self.order())
+        self.assertEqual(self.api('deliveries/commit',{'ref':'D1'})[1]['reason'],'CONFLICTING_PHYSICAL_EVIDENCE')
+        before=self.api('inventory')[1][0]
+        self.assertFalse(self.api('investigations?evidence_id='+str(eid-1))[1]['evidence']['is_latest'])
+        self.assertTrue(self.api('investigations?evidence_id='+str(eid))[1]['evidence']['is_latest'])
+        self.assertEqual(self.api('investigations/resolve',{'evidence_id':eid-1,'ref':'A0','note':'old count'})[1]['error'],'STALE_EVIDENCE')
+        status,r=self.api('investigations/resolve',{'evidence_id':eid,'ref':'A1','note':'Checked bin and records; keep ledger total'})
+        self.assertEqual((status,r['status'],r['previous'],r['current'],r['version']),(200,'CONFLICT_ACKNOWLEDGED',10,10,1))
+        self.assertEqual(self.api('inventory')[1][0]['qty'],before['qty'])
+        self.assertEqual(self.api('deliveries/commit',{'ref':'D1'})[1]['reason'],'STALE_PHYSICAL_EVIDENCE')
+        self.assertEqual(self.api('investigations/resolve',{'evidence_id':eid,'ref':'A2','note':'repeat'})[1]['error'],'ALREADY_RESOLVED')
+        self.count(10)
+        self.assertEqual(self.api('deliveries/commit',{'ref':'D1'})[1]['status'],'COMPLETED')
+        self.assertEqual(self.api('resolutions')[1][0]['movement_ref'],'A1')
+
     def test_transfer_scoped_and_duplicate_reference(self):
         self.count()
         transfer={'kind':'TRANSFER','ref':'T1','sku':'S','location':'WH/A','destination':'OTHER/B','qty':3}
@@ -195,6 +215,25 @@ class API(unittest.TestCase):
         self.assertEqual(self.api('deliveries')[1],[])
         self.assertEqual(self.call('movements',{'kind':'ADJUST','ref':'X','sku':'S','location':'WH/A','qty':0})[0],401)
         self.assertEqual(self.api('inventory')[1][0]['qty'],original+1)
+
+    def test_zero_negative_counts_and_wrong_scope_evidence(self):
+        _,started=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        self.assertEqual(self.api('counts/submit',{'session_id':started['session_id'],'qty':-1})[1]['error'],'INVALID_QTY')
+        self.assertEqual(self.api('counts/submit',{'session_id':started['session_id'],'qty':0})[1]['status'],'DISCREPANCY')
+        self.assertEqual(self.api('movements',{'kind':'TRANSFER','ref':'T','sku':'S','location':'WH/A','destination':'OTHER/B','qty':11})[1]['error'],'INSUFFICIENT_STOCK')
+        self.assertEqual(next(s['qty'] for s in self.api('inventory')[1] if s['sku']=='S' and s['warehouse']=='WH'),10)
+        self.api('products',{'sku':'X','name':'Other product'})
+        self.api('movements',{'kind':'RECEIVE','ref':'R','sku':'X','location':'OTHER/B','qty':2})
+        _,x=self.api('counts/start',{'sku':'X','location':'OTHER/B'})
+        self.api('counts/submit',{'session_id':x['session_id'],'qty':2})
+        _,other_bin=self.api('counts/start',{'sku':'S','location':'OTHER/B'})
+        self.api('counts/submit',{'session_id':other_bin['session_id'],'qty':0})
+        o=self.order(qty=1);self.prepare(o)
+        self.assertEqual(self.api('deliveries/commit',o)[1]['reason'],'DISCREPANCY')
+        self.assertEqual(next(s['qty'] for s in self.api('inventory')[1] if s['sku']=='S' and s['warehouse']=='WH'),10)
+        self.count(10)
+        self.assertEqual(self.api('deliveries/commit',o)[1]['reason'],'CONFLICTING_PHYSICAL_EVIDENCE')
+        self.assertEqual(self.api('movements',{'kind':'ADJUST','ref':'A','sku':'S','location':'WH/A','qty':-1})[1]['error'],'INVALID_QTY')
 
     def test_open_count_survives_new_connection_and_is_actor_scoped(self):
         _,started=self.api('counts/start',{'sku':'S','location':'WH/A'})

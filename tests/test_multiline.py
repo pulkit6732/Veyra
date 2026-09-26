@@ -70,14 +70,40 @@ class Multiline(unittest.TestCase):
     def test_atomic_when_late_insert_fails(self):
         self.counted('S',10);self.counted('B',5);self.ready(self.doc())
         line=self.api('deliveries')[1][0]['lines'][1]
-        # Deliberately occupy the second movement ref; constraint fails AFTER first stock update.
-        self.api('movements',{'ref':'M#'+str(line['id']),'kind':'RECEIVE','sku':'S','location':'OTHER/B','qty':1})
-        before=self.inventory()
-        self.assertEqual(self.api('deliveries/commit',{'ref':'M'})[0],409)
-        self.assertEqual(self.inventory(),before)
-        self.assertEqual(self.delivers(),[])
-        self.assertEqual(self.api('deliveries')[1][0]['state'],'PACKED')
-        self.assertEqual([e for e in self.api('delivery-events')[1] if e['action']=='COMMIT'],[])
+        # Fail on the second movement, after the first line's update/event/decision.
+        with veyra.transaction() as db:
+            db.execute("CREATE TRIGGER fail_second BEFORE INSERT ON movements WHEN NEW.ref='M#%s' BEGIN SELECT RAISE(ABORT,'injected'); END" % line['id'])
+        try:
+            before=self.inventory()
+            self.assertEqual(self.api('deliveries/commit',{'ref':'M'})[0],409)
+            self.assertEqual(self.inventory(),before)
+            self.assertEqual(self.delivers(),[])
+            self.assertEqual(self.api('deliveries')[1][0]['state'],'PACKED')
+            self.assertEqual([e for e in self.api('delivery-events')[1] if e['action']=='COMMIT'],[])
+            self.assertEqual([d for d in self.api('decisions')[1] if d['stage']=='COMMIT'],[])
+        finally:
+            with veyra.transaction() as db:db.execute('DROP TRIGGER fail_second')
+
+    def test_generated_movement_refs_cannot_be_taken(self):
+        self.counted('S',10);self.counted('B',5)
+        self.api('deliveries/preflight',self.doc())
+        second=self.api('deliveries')[1][0]['lines'][1]
+        reserved='M#'+str(second['id'])
+        self.assertEqual(self.api('movements',{'ref':reserved,'kind':'RECEIVE','sku':'S','location':'WH/A','qty':1})[1]['error'],'DUPLICATE_REFERENCE')
+        self.assertEqual(self.api('deliveries/preflight',self.doc(reserved))[1]['error'],'DUPLICATE_REFERENCE')
+        self.ready(self.doc())
+        self.assertEqual(self.api('deliveries/commit',{'ref':'M'})[1]['status'],'COMPLETED')
+        self.assertEqual(len(self.delivers()),2)
+        self.assertEqual(self.api('inventory')[1][0]['version'],1) # B row sorted before S
+
+    def test_preexisting_generated_ref_rejects_draft_not_final_commit(self):
+        # Next line ID is known only to the database; deliberately occupy that name before draft creation.
+        with veyra.transaction() as db:
+            next_id=db.execute('SELECT COALESCE(MAX(id),0)+2 FROM delivery_lines').fetchone()[0]
+        self.api('movements',{'ref':'M#'+str(next_id),'kind':'RECEIVE','sku':'S','location':'OTHER/B','qty':1})
+        self.assertEqual(self.api('deliveries/preflight',self.doc())[1]['error'],'DUPLICATE_REFERENCE')
+        self.assertEqual(self.api('deliveries')[1],[])
+        self.assertEqual(self.api('deliveries/preflight',self.doc('OTHER'))[0],200)
 
     def test_concurrent_commit_and_auth(self):
         self.counted('S',10);self.counted('B',5);self.ready(self.doc())

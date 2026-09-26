@@ -200,7 +200,8 @@ def movement(db, data, actor):
     kind=text(data.get('kind'),'kind').upper()
     if kind not in ('RECEIVE','TRANSFER','ADJUST'): raise Failure('INVALID_MOVEMENT_KIND')
     ref=text(data.get('ref'),'ref',80)
-    if one(db,'SELECT id FROM movements WHERE ref=?',(ref,)) or one(db,'SELECT ref FROM deliveries WHERE ref=?',(ref,)):
+    if (one(db,'SELECT id FROM movements WHERE ref=?',(ref,)) or one(db,'SELECT ref FROM deliveries WHERE ref=?',(ref,))
+            or one(db,"SELECT id FROM delivery_lines WHERE ref || '#' || id=?",(ref,))):
         raise Failure('DUPLICATE_REFERENCE',409)
     p,l,s=scope(db,data.get('sku'),data.get('location'))
     contact=data.get('contact')
@@ -275,7 +276,7 @@ def investigation(db, query):
         signals.append({'type':'UNEXPLAINED','text':'No recorded movement appears in this version window. The physical variance remains unexplained; check the bin and transaction records.'})
     if resolution: signals.append({'type':'RESOLVED','text':'An explicit adjustment was logged. A new agreeing count is still required for delivery.'})
     if not signals: signals.append({'type':'AGREES','text':'The recorded and observed quantities agreed at count submission. This does not prove physical truth.'})
-    return {'sku':p['sku'],'name':p['name'],'location':l['warehouse']+'/'+l['code'],'current':{'qty':s['qty'],'version':s['version']},'evidence':{'id':e['id'],'expected':e['captured_qty'],'observed':e['observed_qty'],'variance':e['observed_qty']-e['captured_qty'],'captured_version':e['captured_version'],'status_at_submission':e['status'],'submitted_at':e['submitted_at']},'last_verified':previous,'events':events,'event_total':total,'signals':signals,'resolution':resolution}
+    return {'sku':p['sku'],'name':p['name'],'location':l['warehouse']+'/'+l['code'],'current':{'qty':s['qty'],'version':s['version']},'evidence':{'id':e['id'],'expected':e['captured_qty'],'observed':e['observed_qty'],'variance':e['observed_qty']-e['captured_qty'],'captured_version':e['captured_version'],'status_at_submission':e['status'],'submitted_at':e['submitted_at'],'is_latest':e['id']==one(db,'SELECT id FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC LIMIT 1',(p['id'],l['id']))['id']},'last_verified':previous,'events':events,'event_total':total,'signals':signals,'resolution':resolution}
 
 def resolve(db,data,actor):
     eid=integer(data.get('evidence_id'),'evidence_id',1)
@@ -288,13 +289,18 @@ def resolve(db,data,actor):
     s=one(db,'SELECT * FROM stock WHERE product_id=? AND location_id=?',(e['product_id'],e['location_id']))
     latest=one(db,'SELECT id FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC',(e['product_id'],e['location_id']))
     if s['version']!=e['captured_version'] or latest['id']!=eid: raise Failure('STALE_EVIDENCE',409)
-    if e['status']!='DISCREPANCY' or e['observed_qty']==s['qty']: raise Failure('NOT_AN_OPEN_DISCREPANCY',409)
+    conflict=one(db,'SELECT COUNT(DISTINCT observed_qty) n FROM evidence WHERE product_id=? AND location_id=? AND captured_version=?',(e['product_id'],e['location_id'],s['version']))['n']>1
+    discrepancy=e['status']=='DISCREPANCY' and e['observed_qty']!=s['qty']
+    # An agreeing latest count does not erase an earlier conflicting count at this version.
+    # Require an explicit logged decision even when the chosen ledger total is unchanged.
+    if not discrepancy and not (conflict and e['status']=='VERIFIED' and e['observed_qty']==s['qty']):
+        raise Failure('NOT_AN_OPEN_DISCREPANCY',409)
     p=one(db,'SELECT * FROM products WHERE id=?',(e['product_id'],))
     l=one(db,'SELECT * FROM locations WHERE id=?',(e['location_id'],))
     version=stock_change(db,p,l,e['observed_qty']-s['qty'])
     db.execute('INSERT INTO movements(ref,kind,product_id,source_id,qty,source_version,actor) VALUES(?,?,?,?,?,?,?)',(ref,'ADJUST',p['id'],l['id'],e['observed_qty'],version,actor))
     db.execute('INSERT INTO resolutions(evidence_id,movement_ref,note,actor) VALUES(?,?,?,?)',(eid,ref,note,actor))
-    return {'status':'ADJUSTED','ref':ref,'evidence_id':eid,'previous':s['qty'],'current':e['observed_qty'],'version':version,'required_action':'RECOUNT'}
+    return {'status':'ADJUSTED' if discrepancy else 'CONFLICT_ACKNOWLEDGED','ref':ref,'evidence_id':eid,'previous':s['qty'],'current':e['observed_qty'],'version':version,'required_action':'RECOUNT'}
 
 def decide(db,ref,p,l,s,qty,actor,stage,line_id=None):
     all_e=rows(db,'SELECT * FROM evidence WHERE product_id=? AND location_id=? ORDER BY id DESC',(p['id'],l['id']))
@@ -376,6 +382,8 @@ def delivery(db,data,actor,commit=False):
         if any(not isinstance(x,dict) for x in supplied): raise Failure('INVALID_LINES')
     if not order and commit: raise Failure('INVALID_STATE_TRANSITION',409)
     if not order:
+        if one(db,"SELECT id FROM delivery_lines WHERE ref || '#' || id=?",(ref,)):
+            raise Failure('DUPLICATE_REFERENCE',409)
         contact=data.get('contact') or None
         if contact is not None: contact=text(contact,'contact')
         destination=data.get('destination') or None
@@ -393,6 +401,9 @@ def delivery(db,data,actor,commit=False):
         for p,l,s,qty in resolved:
             cur=db.execute('INSERT INTO delivery_lines(ref,product_id,location_id,qty) VALUES(?,?,?,?)',(ref,p['id'],l['id'],qty))
             line={'id':cur.lastrowid,'product_id':p['id'],'location_id':l['id']}
+            if (one(db,'SELECT id FROM movements WHERE ref=?',(ref+'#'+str(line['id']),))
+                    or one(db,'SELECT ref FROM deliveries WHERE ref=?',(ref+'#'+str(line['id']),))):
+                raise Failure('DUPLICATE_REFERENCE',409)
             delivery_event(db,{'ref':ref},actor,'CREATE',None,'DRAFT',s['version'],line=line)
         order=one(db,'SELECT * FROM deliveries WHERE ref=?',(ref,))
     lines=delivery_lines(db,ref)

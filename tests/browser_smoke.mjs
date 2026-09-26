@@ -74,13 +74,19 @@ try{
   await evalJS(`document.querySelector('#delivery').requestSubmit()`);
   await waitFor(`document.querySelector('.progress')?.textContent.includes('DRAFT')`);
   for(const [action,expected] of [['READY','READY'],['START_PICKING','PICKING']]){
-    await evalJS(`document.querySelector('[data-step="${action}"]').click()`);
+    await evalJS(`document.querySelector('[data-step="${action}"]').click();document.querySelector('[data-step="${action}"]')?.click()`);
+    await waitFor(`document.querySelector('.progress .current')?.textContent==='${expected}'`);
+    await evalJS(`location.reload()`).catch(()=>{});
     await waitFor(`document.querySelector('.progress .current')?.textContent==='${expected}'`);
   }
   for(const [qty,remaining] of [['9',1],['3',0]]){await evalJS(`{let f=document.querySelector('#delivery-quantity');f.qty.value='${qty}';f.requestSubmit()}`);await waitFor(`document.querySelectorAll('#delivery-quantity option').length===${remaining}`)}
   await evalJS(`document.querySelector('[data-step="COMPLETE_PICKING"]').click()`);
   await waitFor(`document.querySelector('.progress .current')?.textContent==='PICKED'`);
+  await evalJS(`location.reload()`).catch(()=>{});
+  await waitFor(`document.querySelector('.progress .current')?.textContent==='PICKED'`);
   await evalJS(`document.querySelector('[data-step="START_PACKING"]').click()`);
+  await waitFor(`document.querySelector('.progress .current')?.textContent==='PACKING'`);
+  await evalJS(`location.reload()`).catch(()=>{});
   await waitFor(`document.querySelector('.progress .current')?.textContent==='PACKING'`);
   for(const [qty,remaining] of [['9',1],['3',0]]){await evalJS(`{let f=document.querySelector('#delivery-quantity');f.qty.value='${qty}';f.requestSubmit()}`);await waitFor(`document.querySelectorAll('#delivery-quantity option').length===${remaining}`)}
   await evalJS(`document.querySelector('[data-step="COMPLETE_PACKING"]').click()`);
@@ -91,11 +97,16 @@ try{
   await waitFor(`document.querySelector('h1')?.textContent==='Inventory'`);
   await evalJS(`history.back()`);
   await waitFor(`document.querySelector('h1')?.textContent==='Deliveries' && document.querySelector('.progress .current')?.textContent==='PACKED'`);
-  await evalJS(`document.querySelector('#release').click()`);
+  await evalJS(`history.forward()`);
+  await waitFor(`document.querySelector('h1')?.textContent==='Inventory'`);
+  await evalJS(`history.back()`);
+  await waitFor(`document.querySelector('.progress .current')?.textContent==='PACKED'`);
+  await evalJS(`document.querySelector('#release').click();document.querySelector('#release')?.click()`);
   await waitFor(`document.querySelector('#decision')?.textContent.includes('DELIVERY BLOCKED') && document.querySelector('#decision')?.textContent.includes('Recount this product') && document.querySelector('#decision')?.textContent.includes('Current count agrees')`);
-  if(!await evalJS(`(async()=>{let s=await api('inventory'),m=await api('movements');return s.find(x=>x.sku==='S').qty===763&&s.find(x=>x.sku==='B').qty===5&&!m.some(x=>x.kind==='DELIVER')})()`))throw Error('blocked commit mutated stock');
+  if(!await evalJS(`(async()=>{let s=await api('inventory'),m=await api('movements'),d=(await api('decisions')).filter(x=>x.ref==='D1'&&x.stage==='COMMIT');return s.find(x=>x.sku==='S').qty===763&&s.find(x=>x.sku==='B').qty===5&&!m.some(x=>x.kind==='DELIVER')&&d.length===2})()`))throw Error('double-click blocked commit or mutated stock');
   await evalJS(`location.reload()`).catch(()=>{});
   await waitFor(`document.querySelector('.progress .current')?.textContent==='PACKED' && document.querySelector('#content')?.textContent.includes('Latest recorded final attempt')`);
+  if(!await evalJS(`document.querySelector('[data-recount-sku="S"]')?.textContent.includes('Count this line')`))throw Error('persisted blocked attempt lost next action');
   await evalJS(`document.querySelector('[data-page="Evidence Holds"]').click()`);
   await waitFor(`document.querySelector('#content')?.textContent.includes('STALE_PHYSICAL_EVIDENCE')`);
   await evalJS(`document.querySelector('[data-page="Deliveries"]').click()`);
@@ -124,8 +135,61 @@ try{
   await waitFor(`!!document.querySelector('.editor-line') && !!document.querySelector('.line-table') && !!document.querySelector('nav')`);
   const mobile=await evalJS(`({viewport:document.documentElement.clientWidth,content:document.documentElement.scrollWidth,nav:getComputedStyle(document.querySelector('nav')).display,editorColumns:getComputedStyle(document.querySelector('.editor-line')).gridTemplateColumns,tableScroll:document.querySelector('.line-table')?.closest('.table-wrap').scrollWidth})`);
   if(mobile.content>mobile.viewport+2||mobile.nav!=='flex'||!mobile.editorColumns||!mobile.tableScroll)throw Error('mobile delivery layout overflows: '+JSON.stringify(mobile));
-  await evalJS(`location.hash='Deliveries/%'`);
+  for(const width of [430,768,1024,1280,1440]){
+    const id=++seq,answer=new Promise(r=>pending.set(id,r));ws.send(JSON.stringify({id,method:'Emulation.setDeviceMetricsOverride',params:{width,height:900,deviceScaleFactor:1,mobile:width===768}}));await answer;
+    const layout=await evalJS(`({width:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth,nav:getComputedStyle(document.querySelector('nav')).display})`);
+    if(layout.width<width-20||layout.width>width||layout.scroll>layout.width+2||layout.nav===(width<=768?'grid':'flex'))throw Error('layout at '+width+': '+JSON.stringify(layout));
+  }
+  for(const width of [390,768,1440]){
+    const id=++seq,answer=new Promise(r=>pending.set(id,r));ws.send(JSON.stringify({id,method:'Emulation.setDeviceMetricsOverride',params:{width,height:900,deviceScaleFactor:1,mobile:width<800}}));await answer;
+    for(const page of ['Dashboard','Inventory','Physical Verification','Investigation','Receipts','Deliveries','Audit']){
+      await evalJS(`document.querySelector('[data-page=${JSON.stringify(page)}]')?.click()`);
+      await waitFor(`document.querySelector('h1')?.textContent===${JSON.stringify(page)} && !document.querySelector('#content')?.textContent.startsWith('Loading')`);
+      const sizes=await evalJS(`({width:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth,buttons:[...document.querySelectorAll('#content button')].filter(b=>{let r=b.getBoundingClientRect();return !b.closest('.table-wrap, nav') && r.width>0 && (r.left< -1||r.right>innerWidth+1)}).length})`);
+      if(sizes.scroll>sizes.width+2||sizes.buttons)throw Error('section overflow '+page+' at '+width+': '+JSON.stringify(sizes));
+    }
+  }
+  await evalJS(`location.hash='Deliveries/not-found'`);
+  await waitFor(`document.querySelector('#content')?.textContent.includes('Delivery not-found was not found')`);
+  await evalJS(`window.realFetch=window.fetch;window.fetch=(...args)=>String(args[0]).includes('/api/inventory')?Promise.resolve(new Response(JSON.stringify({error:'UNAVAILABLE'}),{status:503,headers:{'Content-Type':'application/json'}})):window.realFetch(...args);render('Inventory')`);
+  await waitFor(`document.querySelector('#content')?.textContent.includes('Unable to load Inventory')`);
+  await evalJS(`window.fetch=window.realFetch;document.querySelector('[data-page="Inventory"]').click()`);
+  await waitFor(`document.querySelector('#stock-table')?.textContent.includes('754')`);
+  await evalJS(`window.fetch=(...args)=>String(args[0]).includes('/api/inventory')?new Promise(resolve=>setTimeout(()=>resolve(window.realFetch(...args)),350)):window.realFetch(...args);window.slowRender=render('Inventory');'started'`);
+  if(!await evalJS(`document.querySelector('#content')?.textContent.includes('Loading')`))throw Error('slow API did not retain loading state');
+  await waitFor(`document.querySelector('#stock-table')?.textContent.includes('754')`);
+  await evalJS(`window.fetch=window.realFetch;location.hash='Deliveries/%'`);
   await waitFor(`document.querySelector('h1')?.textContent==='Dashboard'`);
+  // On the real seeded ledger, an agreeing latest count must not hide an older conflict.
+  await evalJS(`document.querySelector('[data-page="Physical Verification"]').click()`);
+  await waitFor(`!!document.querySelector('#count-start')`);
+  for(const quantity of ['1','2']){
+    await evalJS(`{let f=document.querySelector('#count-start');f.sku.value='B';f.location.value='WH/A';f.requestSubmit()}`);
+    await waitFor(`!!document.querySelector('#count-submit')`);
+    await evalJS(`{let f=document.querySelector('#count-submit');f.qty.value='${quantity}';f.requestSubmit()}`);
+    await waitFor(`document.querySelector('h1')?.textContent==='Investigation'`);
+    if(quantity==='1'){await evalJS(`document.querySelector('[data-page="Physical Verification"]').click()`);await waitFor(`!!document.querySelector('#count-start')`)}
+  }
+  await waitFor(`document.querySelector('.investigate')?.textContent.includes('CONFLICTING COUNTS') && !!document.querySelector('#resolve')`);
+  if(!await evalJS(`(async()=>{let r=await api('deliveries/preflight',{ref:'CONFLICT',sku:'B',location:'WH/A',qty:1});return r.reason==='CONFLICTING_PHYSICAL_EVIDENCE'})()`))throw Error('agreeing latest count cleared conflict');
+  await evalJS(`{let f=document.querySelector('#resolve');f.ref.value='ACK1';f.note.value='Bin and movement records reviewed; keep ledger';f.requestSubmit()}`);
+  await waitFor(`document.querySelector('.investigate')?.textContent.includes('Conflict acknowledged; ledger quantity unchanged')`);
+  if(!await evalJS(`(async()=>{let s=await api('inventory'),m=await api('movements');return s.find(x=>x.sku==='B').qty===2 && s.find(x=>x.sku==='B').version===2 && m.find(x=>x.ref==='ACK1').qty===2})()`))throw Error('conflict acknowledgment changed ledger total');
+  // Exercise a real 409 through the form, not just the API helper: duplicate receipt ref.
+  await evalJS(`document.querySelector('[data-page="Receipts"]').click()`);
+  await waitFor(`!!document.querySelector('#receipt')`);
+  await evalJS(`{let f=document.querySelector('#receipt');for(let [k,v] of Object.entries({ref:'R1',contact:'Supplier',sku:'S',location:'WH/A',qty:'2'}))f[k].value=v;f.requestSubmit()}`);
+  await waitFor(`document.querySelector('#notice')?.textContent.includes('reference')`);
+  if(!await evalJS(`(async()=>{let x=await api('inventory');return x.find(r=>r.sku==='S').qty===754})()`))throw Error('duplicate receipt changed stock');
+  // A 500 must remain an error, and a lost session must return to sign-in.
+  await evalJS(`window.fetch=(...args)=>String(args[0]).includes('/api/inventory')?Promise.resolve(new Response(JSON.stringify({error:'UNAVAILABLE'}),{status:500,headers:{'Content-Type':'application/json'}})):window.realFetch(...args);render('Inventory')`);
+  await waitFor(`document.querySelector('#content')?.textContent.includes('Server error')`);
+  await evalJS(`window.fetch=window.realFetch;sessionStorage.setItem('veyra_token','expired');state.token='expired';render('Inventory')`);
+  await waitFor(`!!document.querySelector('#auth')`);
+  await evalJS(`{let f=document.querySelector('#auth');f.username.value='browser';f.password.value='password1234';f.requestSubmit()}`);
+  await waitFor(`document.querySelector('h1')?.textContent==='Inventory' && document.querySelector('#stock-table')?.textContent.includes('754')`);
+  await evalJS(`document.querySelector('[data-page="Dashboard"]').click()`);
+  await waitFor(`document.querySelector('#content')?.textContent.includes('Operational overview')`);
   console.log('Chrome two-line Deliveries render (including API calls):',renderMs,'ms; 390px mobile:',JSON.stringify(mobile));
   console.log('Browser PASS: seeded discrepancy → adjustment → receipt → stale hold → recount → two-line atomic commit → audit');
 } catch(e){console.error('Browser FAIL:',e);process.exitCode=1}
