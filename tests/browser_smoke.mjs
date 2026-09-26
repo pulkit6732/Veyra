@@ -49,6 +49,8 @@ try{
   await waitFor(`!!document.querySelector('#count-submit')`);
   await evalJS(`{let f=document.querySelector('#count-submit');f.qty.value='761';f.requestSubmit()}`);
   await waitFor(`document.querySelector('h1')?.textContent==='Investigation'`);
+  // Hold an older count open until after the receipt and the v2 recount.
+  const oldCount=await evalJS(`(async()=>{let user=await api('signup',{username:'latecounter',password:'password1234'});sessionStorage.setItem('late_count_token',user.token);return (await fetch('/api/counts/start',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+user.token},body:JSON.stringify({sku:'S',location:'WH/A'})})).json()})()`);
   await evalJS(`document.querySelector('[data-page="Receipts"]').click()`);
   await waitFor(`!!document.querySelector('#receipt')`);
   await evalJS(`{let f=document.querySelector('#receipt');for(let [k,v] of Object.entries({ref:'R1',contact:'Supplier',sku:'S',location:'WH/A',qty:'2'}))f[k].value=v;f.requestSubmit()}`);
@@ -118,10 +120,13 @@ try{
   await waitFor(`!!document.querySelector('#count-submit')`);
   await evalJS(`{let f=document.querySelector('#count-submit');f.qty.value='763';f.requestSubmit()}`);
   await waitFor(`document.querySelector('h1')?.textContent==='Investigation'`);
+  const lateResult=await evalJS(`fetch('/api/counts/submit',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+sessionStorage.getItem('late_count_token')},body:JSON.stringify({session_id:${oldCount.session_id},qty:761})}).then(r=>r.json())`);
+  if(lateResult?.status!=='STALE')throw Error('late observation was not stale: '+JSON.stringify({oldCount,lateResult}));
   await evalJS(`document.querySelector('[data-page="Deliveries"]').click()`);
   await waitFor(`!!document.querySelector('[data-order="D1"]')`);
   await evalJS(`document.querySelector('[data-order="D1"]').click()`);
   await waitFor(`document.querySelector('#release')!==null`);
+  if(!await evalJS(`document.querySelector('.line-table tbody tr')?.textContent.includes('CURRENT')`))throw Error('late stale observation hid current count in delivery');
   await evalJS(`document.querySelector('#release').click()`);
   await waitFor(`document.querySelector('#decision')?.textContent.includes('DELIVERY COMPLETED')`);
   await evalJS(`document.querySelector('[data-page="Inventory"]').click()`);

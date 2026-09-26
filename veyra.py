@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS delivery_events(id INTEGER PRIMARY KEY, ref TEXT NOT 
 CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, ref TEXT NOT NULL REFERENCES deliveries(ref), stage TEXT NOT NULL CHECK(stage IN ('PREFLIGHT','COMMIT')), status TEXT NOT NULL, reason TEXT NOT NULL, evidence_version INTEGER, current_version INTEGER NOT NULL, evidence_id INTEGER REFERENCES evidence(id), stock_qty INTEGER NOT NULL, actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS ix_movements_product ON movements(product_id,created_at);
 CREATE INDEX IF NOT EXISTS ix_evidence_scope ON evidence(product_id,location_id,captured_version);
+CREATE INDEX IF NOT EXISTS ix_evidence_latest ON evidence(product_id,location_id,id DESC);
+CREATE INDEX IF NOT EXISTS ix_movements_source_version ON movements(product_id,source_id,source_version);
+CREATE INDEX IF NOT EXISTS ix_movements_dest_version ON movements(product_id,dest_id,dest_version);
 """
 
 class Failure(Exception):
@@ -56,25 +59,27 @@ def connect():
 def init():
     db=connect()
     try:
-        # Existing PENDING orders are drafts; never infer that picking or packing happened.
+        # Persist WAL mode once per database; keep FK and timeout settings per connection.
+        if db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower() != 'wal':
+            raise RuntimeError('Unable to enable SQLite WAL')
+        # The legacy table rebuild needs FK checks deferred until after the rename.
+        # Run ALL schema/backfill work in one transaction, including opening checkpoints.
         legacy=one(db,"SELECT name FROM sqlite_master WHERE type='table' AND name='deliveries'")
-        if legacy and 'picked_qty' not in [r['name'] for r in db.execute('PRAGMA table_info(deliveries)')]:
-            db.execute('PRAGMA foreign_keys=OFF')
-            try:
-                db.execute('BEGIN IMMEDIATE')
+        legacy=legacy and 'picked_qty' not in [r['name'] for r in db.execute('PRAGMA table_info(deliveries)')]
+        if legacy: db.execute('PRAGMA foreign_keys=OFF')
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            if legacy:
+                # PENDING/CANCELED are drafts; no pick/pack history is inferred.
                 db.execute("""CREATE TABLE deliveries_new(ref TEXT PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id), qty INTEGER NOT NULL CHECK(qty>0), contact TEXT, state TEXT NOT NULL CHECK(state IN ('DRAFT','READY','PICKING','PICKED','PACKING','PACKED','DONE')), picked_qty INTEGER NOT NULL DEFAULT 0 CHECK(picked_qty>=0 AND picked_qty<=qty), packed_qty INTEGER NOT NULL DEFAULT 0 CHECK(packed_qty>=0 AND packed_qty<=picked_qty), actor INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
                 db.execute("INSERT INTO deliveries_new(ref,product_id,location_id,qty,contact,state,actor,created_at) SELECT ref,product_id,location_id,qty,contact,CASE WHEN state='DONE' THEN 'DONE' ELSE 'DRAFT' END,actor,created_at FROM deliveries")
                 db.execute('DROP TABLE deliveries')
                 db.execute('ALTER TABLE deliveries_new RENAME TO deliveries')
-                db.commit()
-            except Exception:
-                db.rollback(); raise
-            finally:
-                db.execute('PRAGMA foreign_keys=ON')
-        db.executescript(SCHEMA)
-        # Additive P2 migration: retain legacy header fields and historical foreign keys.
-        # Each historical order becomes one line; no pick/pack history is invented.
-        with db:
+            # executescript commits implicitly; execute each schema statement instead.
+            for statement in SCHEMA.split(';'):
+                if statement.strip(): db.execute(statement)
+            # Additive P2 migration: retain legacy header fields and historical foreign keys.
+            # Each historical order becomes one line; no pick/pack history is invented.
             db.execute('''CREATE TABLE IF NOT EXISTS delivery_lines(
                 id INTEGER PRIMARY KEY, ref TEXT NOT NULL REFERENCES deliveries(ref),
                 product_id INTEGER NOT NULL REFERENCES products(id), location_id INTEGER NOT NULL REFERENCES locations(id),
@@ -97,14 +102,39 @@ def init():
                 (SELECT 1 FROM deliveries WHERE deliveries.ref=movements.ref)''')
             db.execute('CREATE INDEX IF NOT EXISTS ix_delivery_lines_ref ON delivery_lines(ref)')
             db.execute('CREATE INDEX IF NOT EXISTS ix_movements_delivery ON movements(delivery_ref,line_id)')
-        if db.execute('PRAGMA foreign_key_check').fetchone(): raise RuntimeError('Database foreign key check failed')
+            # An opening is an imported snapshot, NOT a historical receipt or a physical count.
+            # The watermark excludes pre-checkpoint movements, even at the same version.
+            db.execute('''CREATE TABLE IF NOT EXISTS opening_balances(
+                product_id INTEGER NOT NULL, location_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'OPENING_BALANCE' CHECK(kind='OPENING_BALANCE'),
+                qty INTEGER NOT NULL CHECK(qty>=0), version INTEGER NOT NULL,
+                after_movement_id INTEGER NOT NULL, recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(product_id,location_id),
+                FOREIGN KEY(product_id,location_id) REFERENCES stock(product_id,location_id))''')
+            db.execute('''INSERT INTO opening_balances(product_id,location_id,qty,version,after_movement_id)
+                SELECT s.product_id,s.location_id,s.qty,s.version,
+                    COALESCE((SELECT MAX(id) FROM movements),0) FROM stock s
+                WHERE NOT EXISTS (SELECT 1 FROM opening_balances b
+                    WHERE b.product_id=s.product_id AND b.location_id=s.location_id)''')
+            # Future zero scopes and seed inserts get their anchor in the same transaction.
+            db.execute('''CREATE TRIGGER IF NOT EXISTS opening_on_stock_insert AFTER INSERT ON stock BEGIN
+                INSERT INTO opening_balances(product_id,location_id,qty,version,after_movement_id)
+                VALUES(NEW.product_id,NEW.location_id,NEW.qty,NEW.version,
+                    COALESCE((SELECT MAX(id) FROM movements),0)); END''')
+            if db.execute('PRAGMA foreign_key_check').fetchone(): raise RuntimeError('Database foreign key check failed')
+            db.commit()
+        except Exception:
+            db.rollback(); raise
+        finally:
+            if legacy: db.execute('PRAGMA foreign_keys=ON')
     finally: db.close()
 
 @contextmanager
-def transaction():
+def transaction(read_only=False):
     db = connect()
     try:
-        db.execute('BEGIN IMMEDIATE')
+        # A GET needs one consistent snapshot, but must not acquire the writer lock.
+        db.execute('BEGIN' if read_only else 'BEGIN IMMEDIATE')
         yield db
         db.commit()
     except Exception:
@@ -120,7 +150,7 @@ def one(db, sql, args=()):
     r = db.execute(sql, args).fetchone()
     return dict(r) if r else None
 
-def scope(db, sku, location):
+def scope(db, sku, location, create=True):
     p = one(db, 'SELECT * FROM products WHERE sku=?', (text(sku,'sku'),))
     l = one(db, 'SELECT l.*,w.code warehouse FROM locations l JOIN warehouses w ON w.id=l.warehouse_id WHERE l.code=? OR (w.code || "/" || l.code)=?', (location,location)) if isinstance(location,str) else None
     if not p or not l:
@@ -128,9 +158,10 @@ def scope(db, sku, location):
     # unqualified codes must be unique across warehouses
     if '/' not in location and one(db,'SELECT COUNT(*) n FROM locations WHERE code=?',(location,))['n'] > 1:
         raise Failure('AMBIGUOUS_LOCATION')
-    db.execute('INSERT OR IGNORE INTO stock(product_id,location_id) VALUES(?,?)',(p['id'],l['id']))
+    if create:
+        db.execute('INSERT OR IGNORE INTO stock(product_id,location_id) VALUES(?,?)',(p['id'],l['id']))
     s = one(db,'SELECT * FROM stock WHERE product_id=? AND location_id=?',(p['id'],l['id']))
-    return p,l,s
+    return p,l,s or {'product_id':p['id'],'location_id':l['id'],'qty':0,'version':0}
 
 def auth(db, token):
     s = one(db,'SELECT user_id FROM sessions WHERE token=? AND expires>?',(token or '',int(time.time())))
@@ -247,7 +278,7 @@ def investigation(db, query):
         l=one(db,'SELECT l.*,w.code warehouse FROM locations l JOIN warehouses w ON w.id=l.warehouse_id WHERE l.id=?',(e['location_id'],))
         s=one(db,'SELECT * FROM stock WHERE product_id=? AND location_id=?',(p['id'],l['id']))
     else:
-        p,l,s=scope(db,query.get('sku',[None])[0],query.get('location',[None])[0])
+        p,l,s=scope(db,query.get('sku',[None])[0],query.get('location',[None])[0],create=False)
         e=one(db,'SELECT e.*,cs.captured_qty FROM evidence e JOIN count_sessions cs ON cs.id=e.session_id WHERE e.product_id=? AND e.location_id=? ORDER BY e.id DESC LIMIT 1',(p['id'],l['id']))
     if not e:
         return {'sku':p['sku'],'name':p['name'],'location':l['warehouse']+'/'+l['code'],'current':{'qty':s['qty'],'version':s['version']},'evidence':None,'last_verified':None,'events':[],'event_total':0,'signals':[{'type':'NO_EVIDENCE','text':'No physical count is recorded for this SKU and location. Requires verification.'}],'resolution':None}
@@ -484,8 +515,11 @@ def list_data(db,name,query):
             JOIN stock s ON s.product_id=dl.product_id AND s.location_id=dl.location_id
         ), latest AS (
             SELECT sc.*,e.captured_version,e.observed_qty FROM scopes sc
-            LEFT JOIN evidence e ON e.id=(SELECT id FROM evidence
-                WHERE product_id=sc.product_id AND location_id=sc.location_id ORDER BY id DESC LIMIT 1)
+            LEFT JOIN evidence e ON e.id=COALESCE(
+                (SELECT id FROM evidence WHERE product_id=sc.product_id AND location_id=sc.location_id
+                 AND captured_version=sc.version ORDER BY id DESC LIMIT 1),
+                (SELECT id FROM evidence WHERE product_id=sc.product_id AND location_id=sc.location_id
+                 ORDER BY id DESC LIMIT 1))
         ), conflicts AS (
             SELECT sc.product_id,sc.location_id,COUNT(DISTINCT e.observed_qty) varieties
             FROM scopes sc JOIN evidence e ON e.product_id=sc.product_id
@@ -526,7 +560,7 @@ class Handler(BaseHTTPRequestHandler):
             try: data=json.loads(self.rfile.read(size))
             except (ValueError,UnicodeDecodeError): raise Failure('MALFORMED_INPUT')
             if not isinstance(data,dict): raise Failure('MALFORMED_INPUT')
-        with transaction() as db:
+        with transaction(read_only=self.command=='GET') as db:
             if self.command=='POST' and name in ('signup','login'):
                 result=login(db,data,name=='signup')
             else:

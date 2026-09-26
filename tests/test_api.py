@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.parse import quote
@@ -33,7 +34,7 @@ class API(unittest.TestCase):
             finally:e.close()
     def setUp(self):
         with veyra.transaction() as db:
-            for table in ('delivery_events','decisions','resolutions','movements','delivery_lines','deliveries','evidence','count_sessions','stock','sessions','locations','warehouses','products','categories','users'):
+            for table in ('delivery_events','decisions','resolutions','movements','delivery_lines','deliveries','evidence','count_sessions','opening_balances','stock','sessions','locations','warehouses','products','categories','users'):
                 db.execute('DELETE FROM '+table)
         _,u=self.call('signup',{'username':'worker','password':'longpassword123'})
         self.token=u['token'];self.setup_base()
@@ -197,7 +198,9 @@ class API(unittest.TestCase):
         self.assertEqual(len(self.api('resolutions')[1]),0)
     def test_seeded_demo_story_from_persisted_versions(self):
         with veyra.transaction() as db:
-            db.execute('UPDATE stock SET qty=768,version=0 WHERE product_id=1 AND location_id=1')
+            db.execute('DELETE FROM opening_balances WHERE product_id=1 AND location_id=1')
+            db.execute('DELETE FROM stock WHERE product_id=1 AND location_id=1')
+            db.execute('INSERT INTO stock(product_id,location_id,qty,version) VALUES(1,1,768,0)')
         self.assertEqual(self.count(761)['status'],'DISCREPANCY')
         _,case=self.api('investigations?sku=S&location=WH/A')
         self.assertEqual((case['evidence']['expected'],case['evidence']['observed'],case['evidence']['variance']),(768,761,-7))
@@ -345,6 +348,73 @@ class API(unittest.TestCase):
         self.count(11)
         self.assertEqual(self.api('deliveries/commit',o)[1]['status'],'COMPLETED')
         self.assertEqual(self.api('inventory')[1][0]['qty'],7)
+    def test_read_snapshot_does_not_block_writer_or_create_stock(self):
+        # A multi-query GET must not reserve the only SQLite writer slot.
+        with veyra.transaction(read_only=True) as reader:
+            before=veyra.one(reader,'SELECT qty,version FROM stock WHERE product_id=1 AND location_id=1')
+            out=[]
+            worker=threading.Thread(target=lambda: out.append(self.api('movements',
+                {'ref':'R','kind':'RECEIVE','sku':'S','location':'WH/A','qty':2})))
+            worker.start();worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), 'writer blocked by a reader')
+            self.assertEqual(out[0][0],200)
+            self.assertEqual(veyra.one(reader,'SELECT qty,version FROM stock WHERE product_id=1 AND location_id=1'),before)
+        self.assertEqual(self.api('inventory')[1][0]['qty'],12)
+        with closing(veyra.connect()) as db:
+            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0],'wal')
+            self.assertEqual(db.execute('PRAGMA foreign_keys').fetchone()[0],1)
+            self.assertEqual(db.execute('PRAGMA busy_timeout').fetchone()[0],15000)
+            self.assertIsNone(db.execute('SELECT * FROM stock WHERE product_id=1 AND location_id=2').fetchone())
+        self.assertIsNone(self.api('investigations?sku=S&location=OTHER/B')[1]['evidence'])
+        with closing(veyra.connect()) as db:
+            self.assertIsNone(db.execute('SELECT * FROM stock WHERE product_id=1 AND location_id=2').fetchone())
+
+    def test_count_submission_racing_with_commit_retains_start_version(self):
+        self.count()
+        self.prepare(self.order(qty=4))
+        _,started=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        gate=threading.Barrier(3);out={}
+        def commit():
+            gate.wait();out['commit']=self.api('deliveries/commit',{'ref':'D1'})
+        def submit():
+            gate.wait();out['count']=self.api('counts/submit',{'session_id':started['session_id'],'qty':10})
+        threads=[threading.Thread(target=run) for run in (commit,submit)]
+        for t in threads:t.start()
+        gate.wait()
+        for t in threads:t.join(timeout=5)
+        self.assertTrue(all(not t.is_alive() for t in threads))
+        self.assertEqual((out['commit'][1]['status'],out['count'][0]),('COMPLETED',200))
+        self.assertEqual(out['count'][1]['evidence_version'],started['captured_version'])
+        self.assertIn(out['count'][1]['status'],('VERIFIED','STALE'))
+        self.assertEqual(self.api('inventory')[1][0]['qty'],6)
+        self.assertEqual(len([m for m in self.api('movements')[1] if m['kind']=='DELIVER']),1)
+        self.assertEqual(self.api('deliveries/commit',{'ref':'D1'})[1]['reason'],'ALREADY_COMPLETED')
+
+    def test_reconstruct_known_opening_and_versions_from_full_ledger(self):
+        # Fixture opening is known independently; public lists are bounded, so use full DB rows.
+        self.count()
+        self.api('movements',{'ref':'R','kind':'RECEIVE','sku':'S','location':'WH/A','qty':3})
+        self.assertEqual(self.count(13)['status'],'VERIFIED')
+        self.prepare(self.order(qty=4))
+        self.assertEqual(self.api('deliveries/commit',{'ref':'D1'})[1]['status'],'COMPLETED')
+        self.api('movements',{'ref':'A','kind':'ADJUST','sku':'S','location':'WH/A','qty':8})
+        self.assertEqual(self.count(8)['status'],'VERIFIED')
+        with closing(veyra.connect()) as db:
+            movements=veyra.rows(db,'SELECT * FROM movements ORDER BY id')
+            evidence=veyra.rows(db,'SELECT * FROM evidence ORDER BY id')
+            decisions=veyra.rows(db,"SELECT * FROM decisions WHERE stage='COMMIT' ORDER BY id")
+            current=veyra.one(db,'SELECT qty,version FROM stock WHERE product_id=1 AND location_id=1')
+        qty,version=10,0
+        for m in movements:
+            self.assertEqual(m['source_version'] or m['dest_version'],version+1)
+            qty=qty+m['qty'] if m['kind']=='RECEIVE' else qty-m['qty'] if m['kind']=='DELIVER' else m['qty']
+            version+=1
+        self.assertEqual((qty,version),(current['qty'],current['version']))
+        self.assertEqual([(e['captured_version'],e['observed_qty']) for e in evidence],[(0,10),(1,13),(3,8)])
+        self.assertEqual([(d['reason'],d['stock_qty'],d['current_version'],d['evidence_id']) for d in decisions],
+                         [('VERIFIED',13,1,evidence[1]['id'])])
+        self.assertEqual(movements[1]['delivery_ref'],'D1')
+
     def test_concurrent_commits_one_movement(self):
         self.count();o=self.order();self.prepare(o);barrier=threading.Barrier(3);out=[]
         def run():barrier.wait();out.append(self.api('deliveries/commit',o))

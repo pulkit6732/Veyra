@@ -179,6 +179,15 @@ class Multiline(unittest.TestCase):
         self.assertEqual(self.call('deliveries/step',{'ref':'M','action':'PICK','line_id':next(x for x in m if x['ref']=='M')['lines'][0]['id'],'qty':1},other['token'])[0],200)
         self.assertEqual(self.call('deliveries/commit',{'ref':'M'})[0],401)
 
+    def test_late_stale_count_does_not_hide_current_delivery_hint(self):
+        _,old=self.api('counts/start',{'sku':'S','location':'WH/A'})
+        self.api('movements',{'ref':'R','kind':'RECEIVE','sku':'S','location':'WH/A','qty':1})
+        self.counted('S',11)
+        self.api('counts/submit',{'session_id':old['session_id'],'qty':10})
+        self.api('deliveries/preflight',self.doc())
+        self.assertEqual(self.api('deliveries')[1][0]['lines'][0]['evidence'],'CURRENT')
+        self.assertEqual(self.api('deliveries/preflight',{'ref':'M'})[1]['lines'][0]['reason'],'VERIFIED')
+
     def test_delivery_list_batches_scopes_and_retains_line_labels(self):
         self.counted('S',10)
         self.counted('B',5)

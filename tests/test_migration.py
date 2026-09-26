@@ -28,6 +28,7 @@ class Migration(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM delivery_lines').fetchone()[0],1)
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM decisions').fetchone()[0],1)
                 self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
+                self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0],'wal')
                 db.close()
             finally:veyra.DB=original
 
@@ -61,6 +62,7 @@ class Migration(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT picked_qty,packed_qty FROM deliveries WHERE ref='OLD'").fetchone()[:],(0,0))
                 self.assertEqual(db.execute('SELECT ref FROM decisions').fetchone()[0],'OLD')
                 self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
+                self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0],'wal')
                 db.close()
                 veyra.init()
             finally:
